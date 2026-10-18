@@ -1,0 +1,15 @@
+# macOS files
+.DS_Store
+
+# Compiled executable
+terminator
+*.o
+
+# Backup folders
+src-backup-before-multiwatch/
+
+# Patch files
+*.patch
+
+# VS Code local settings
+.vscode/
