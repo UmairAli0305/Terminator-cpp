@@ -11,6 +11,7 @@
 #include <algorithm>
 
 #include <unistd.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <cerrno>
 #include <cstdio>
@@ -21,10 +22,27 @@
 
 TerminalWindow::TerminalWindow()
     : display(nullptr), window(0), gc(0) {
+    int wakePipe[2];
+    if (pipe(wakePipe) == -1) {
+        perror("pipe");
+    } else {
+        wakeReadFd = wakePipe[0];
+        wakeWriteFd = wakePipe[1];
+        for (int fd : wakePipe) {
+            int flags = fcntl(fd, F_GETFL, 0);
+            if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            int fdflags = fcntl(fd, F_GETFD, 0);
+            if (fdflags >= 0) fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC);
+        }
+    }
     createTab();
 }
 
 TerminalWindow::~TerminalWindow() {
+    // Workers must finish before the wake-up pipe is closed.
+    tabs.clear();
+    if (wakeReadFd >= 0) close(wakeReadFd);
+    if (wakeWriteFd >= 0) close(wakeWriteFd);
     if (display) {
         if (gc) XFreeGC(display, gc);
         if (window) XDestroyWindow(display, window);
@@ -56,8 +74,19 @@ void TerminalWindow::scroll(int amount) {
 }
 
 
+void TerminalWindow::notifyGui() const {
+    if (wakeWriteFd < 0) return;
+    const unsigned char signal = 1;
+    // Nonblocking: EAGAIN means the pipe already contains a wake notification.
+    ssize_t result;
+    do { result = write(wakeWriteFd, &signal, 1); }
+    while (result < 0 && errno == EINTR);
+}
+
 void TerminalWindow::createTab() {
-    tabs.push_back(std::make_unique<Tab>());
+    auto tab = std::make_unique<Tab>();
+    tab->setGuiNotifier([this] { notifyGui(); });
+    tabs.push_back(std::move(tab));
     activeTab = static_cast<int>(tabs.size()) - 1;
 }
 
@@ -68,7 +97,8 @@ void TerminalWindow::switchTab() {
 void TerminalWindow::closeTab() {
     // For now, don't destroy a tab with a running child process.
     if (currentTab().executor.hasJobs() ||
-        !currentTab().commandQueue.empty()) {
+        !currentTab().commandQueue.empty() ||
+        currentTab().hasPendingSubmission()) {
         currentTab().lines.push_back(
             "Wait for the command to finish before closing this tab."
         );
@@ -518,7 +548,8 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
     }
 
     Tab& tab = currentTab();
-    if (tab.executor.isRunning() || !tab.commandQueue.empty()) return;
+    if (tab.executor.isRunning() || !tab.commandQueue.empty() ||
+        tab.hasPendingSubmission()) return;
     bool wasScrolled = (tab.scrollOffset != 0);
     tab.scrollOffset = 0;
 
@@ -547,8 +578,7 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
             redraw();
             return;
         }
-        tab.commandQueue.push_back({rawCommand, 0});
-        processCommandQueue(tab);
+        tab.submitCommand(rawCommand);
     }
     else if (count > 0) {
         for (int i = 0; i < count; ++i) {
@@ -598,7 +628,8 @@ void TerminalWindow::run() {
                     bool anyRunning = false;
 
                     for (const auto& tab : tabs) {
-                        if (tab->executor.hasJobs() || !tab->commandQueue.empty()) {
+                        if (tab->executor.hasJobs() || !tab->commandQueue.empty() ||
+                            tab->hasPendingSubmission()) {
                             anyRunning = true;
                             break;
                         }
@@ -622,6 +653,15 @@ void TerminalWindow::run() {
         if (!running)
             break;
 
+        // Collect prepared commands from each tab's worker on the GUI thread.
+        // No worker directly touches the GUI, shell state or command queue.
+        for (auto& tab : tabs) {
+            for (std::string& command : tab->takeSubmittedCommands())
+                tab->commandQueue.push_back({std::move(command), 0});
+            if (!tab->commandQueue.empty() && !tab->executor.isRunning())
+                processCommandQueue(*tab);
+        }
+
         // Poll X11 and output pipes for all foreground/background jobs.
         std::vector<pollfd> fds;
         std::vector<std::pair<Tab*, int>> monitored;
@@ -629,6 +669,13 @@ void TerminalWindow::run() {
         xfd.fd = ConnectionNumber(display);
         xfd.events = POLLIN;
         fds.push_back(xfd);
+        if (wakeReadFd >= 0) {
+            pollfd wakeFd{};
+            wakeFd.fd = wakeReadFd;
+            wakeFd.events = POLLIN;
+            fds.push_back(wakeFd);
+        }
+        const size_t outputStart = fds.size();
         for (auto& tab : tabs) {
             for (int fdNumber : tab->executor.outputFds()) {
                 pollfd fd{};
@@ -640,15 +687,19 @@ void TerminalWindow::run() {
         }
         // A bounded timeout allows waitpid(WNOHANG|WUNTRACED) to detect
         // stopped/exited children even when their output pipe stays open.
-        int result = poll(fds.data(), fds.size(), 100);
+        int result = poll(fds.data(), fds.size(), 10);
         if (result < 0) {
             if (errno == EINTR) continue;
             perror("poll");
             break;
         }
-        for (size_t i = 1; i < fds.size(); ++i) {
+        if (wakeReadFd >= 0 && (fds[1].revents & (POLLIN | POLLHUP))) {
+            unsigned char buffer[128];
+            while (read(wakeReadFd, buffer, sizeof(buffer)) > 0) {}
+        }
+        for (size_t i = outputStart; i < fds.size(); ++i) {
             if (fds[i].revents & (POLLIN | POLLHUP | POLLERR))
-                readCommandOutput(*monitored[i - 1].first, monitored[i - 1].second);
+                readCommandOutput(*monitored[i - outputStart].first, monitored[i - outputStart].second);
         }
         for (auto& tab : tabs) updateJobs(*tab);
         if (result > 0) redraw();

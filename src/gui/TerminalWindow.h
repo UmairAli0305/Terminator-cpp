@@ -15,6 +15,9 @@ private:
     Display* display;
     Window window;
     GC gc;
+    int wakeReadFd = -1;
+    int wakeWriteFd = -1;
+    void notifyGui() const;
 
     std::vector<std::unique_ptr<Tab>> tabs;
     int activeTab = 0;
