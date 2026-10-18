@@ -98,7 +98,8 @@ void TerminalWindow::closeTab() {
     // For now, don't destroy a tab with a running child process.
     if (currentTab().executor.hasJobs() ||
         !currentTab().commandQueue.empty() ||
-        currentTab().hasPendingSubmission()) {
+        currentTab().hasPendingSubmission() ||
+        currentTab().isProcessingCommand()) {
         currentTab().lines.push_back(
             "Wait for the command to finish before closing this tab."
         );
@@ -357,9 +358,25 @@ void TerminalWindow::updateJobs(Tab& tab) {
                 tab.pendingOutput.clear();
             }
             tab.shell.setLastStatus(event.status);
-            processCommandQueue(tab);
+            scheduleCommandProcessing(tab);
         }
     }
+}
+
+void TerminalWindow::scheduleCommandProcessing(Tab& tab) {
+    // Caller owns stateMutex; worker will acquire it before touching shell state.
+    if (tab.executor.isRunning() || tab.commandQueue.empty() ||
+        !tab.beginCommandProcessing()) return;
+
+    Tab* target = &tab;
+    tab.enqueueWorkerTask([this, target] {
+        {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            processCommandQueue(*target);
+            target->endCommandProcessing();
+        }
+        notifyGui();
+    });
 }
 
 void TerminalWindow::processCommandQueue(Tab& tab) {
@@ -602,6 +619,7 @@ void TerminalWindow::run() {
     bool running = true;
 
     while (running) {
+        std::unique_lock<std::mutex> stateLock(stateMutex);
         // Handle queued X11 events.
         while (XPending(display) > 0) {
             XEvent event;
@@ -629,7 +647,8 @@ void TerminalWindow::run() {
 
                     for (const auto& tab : tabs) {
                         if (tab->executor.hasJobs() || !tab->commandQueue.empty() ||
-                            tab->hasPendingSubmission()) {
+                            tab->hasPendingSubmission() ||
+                            tab->isProcessingCommand()) {
                             anyRunning = true;
                             break;
                         }
@@ -659,7 +678,7 @@ void TerminalWindow::run() {
             for (std::string& command : tab->takeSubmittedCommands())
                 tab->commandQueue.push_back({std::move(command), 0});
             if (!tab->commandQueue.empty() && !tab->executor.isRunning())
-                processCommandQueue(*tab);
+                scheduleCommandProcessing(*tab);
         }
 
         // Poll X11 and output pipes for all foreground/background jobs.
@@ -687,7 +706,9 @@ void TerminalWindow::run() {
         }
         // A bounded timeout allows waitpid(WNOHANG|WUNTRACED) to detect
         // stopped/exited children even when their output pipe stays open.
+        stateLock.unlock();
         int result = poll(fds.data(), fds.size(), 10);
+        stateLock.lock();
         if (result < 0) {
             if (errno == EINTR) continue;
             perror("poll");

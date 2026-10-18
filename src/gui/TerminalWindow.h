@@ -7,6 +7,7 @@
 #include "../tabs/Tab.h"
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,8 @@ private:
     Display* display;
     Window window;
     GC gc;
+    // Protects shell/executor/command queues and GUI-visible tab state.
+    std::mutex stateMutex;
     int wakeReadFd = -1;
     int wakeWriteFd = -1;
     void notifyGui() const;
@@ -31,6 +34,7 @@ private:
     void readCommandOutput(Tab& tab, int fd);
     void updateJobs(Tab& tab);
     void processCommandQueue(Tab& tab);
+    void scheduleCommandProcessing(Tab& tab);
 
     void createTab();
     void switchTab();

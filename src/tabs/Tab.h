@@ -25,6 +25,7 @@ private:
     std::mutex submittedMutex;
     std::deque<std::string> submittedCommands;
     std::atomic<unsigned> pendingSubmissions{0};
+    std::atomic<bool> processingCommand{false};
     std::function<void()> notifyGui;
 
     void workerLoop() {
@@ -87,6 +88,14 @@ public:
     }
 
     bool hasPendingSubmission() const { return pendingSubmissions.load() != 0; }
+
+    // Only one command-dispatch task may be scheduled per tab.
+    bool beginCommandProcessing() {
+        bool expected = false;
+        return processingCommand.compare_exchange_strong(expected, true);
+    }
+    void endCommandProcessing() { processingCommand.store(false); }
+    bool isProcessingCommand() const { return processingCommand.load(); }
 
     std::string input;
     std::string pendingOutput;
