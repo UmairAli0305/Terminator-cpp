@@ -27,6 +27,7 @@ private:
     std::atomic<unsigned> pendingSubmissions{0};
     std::atomic<bool> processingCommand{false};
     std::atomic<bool> checkingJobs{false};
+    std::atomic<bool> readingOutput{false};
     std::function<void()> notifyGui;
 
     void workerLoop() {
@@ -103,6 +104,13 @@ public:
         return checkingJobs.compare_exchange_strong(expected, true);
     }
     void endJobCheck() { checkingJobs.store(false); }
+
+    bool beginOutputRead() {
+        bool expected = false;
+        return readingOutput.compare_exchange_strong(expected, true);
+    }
+    void endOutputRead() { readingOutput.store(false); }
+    bool isReadingOutput() const { return readingOutput.load(); }
 
     std::string input;
     std::string pendingOutput;

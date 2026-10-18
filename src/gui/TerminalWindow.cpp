@@ -99,7 +99,8 @@ void TerminalWindow::closeTab() {
     if (currentTab().executor.hasJobs() ||
         !currentTab().commandQueue.empty() ||
         currentTab().hasPendingSubmission() ||
-        currentTab().isProcessingCommand()) {
+        currentTab().isProcessingCommand() ||
+        currentTab().isReadingOutput()) {
         currentTab().lines.push_back(
             "Wait for the command to finish before closing this tab."
         );
@@ -341,7 +342,7 @@ void TerminalWindow::appendOutput(
         tab.pendingOutput.erase(0, pos + 1);
     }
 
-    redraw();
+    // The caller schedules a GUI wake-up; workers must never call X11.
 }
 
 void TerminalWindow::readCommandOutput(Tab& tab, int fd) {
@@ -361,6 +362,33 @@ void TerminalWindow::updateJobs(Tab& tab) {
             scheduleCommandProcessing(tab);
         }
     }
+}
+
+void TerminalWindow::scheduleOutputRead(Tab& tab) {
+    // GUI thread holds stateMutex. Coalesce readiness notifications per tab.
+    if (!tab.beginOutputRead()) return;
+    Tab* target = &tab;
+    tab.enqueueWorkerTask([this, target] {
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            // Discover live descriptors inside the lock; a previously-polled
+            // descriptor may already have closed or been reused.
+            for (int fd : target->executor.outputFds()) {
+                const size_t oldLines = target->lines.size();
+                const size_t oldPending = target->pendingOutput.size();
+                readCommandOutput(*target, fd);
+                if (oldLines != target->lines.size() ||
+                    oldPending != target->pendingOutput.size()) changed = true;
+            }
+            // EOF may permit the executor to reap and dispatch queued commands.
+            const size_t before = target->lines.size();
+            updateJobs(*target);
+            if (before != target->lines.size()) changed = true;
+            target->endOutputRead();
+        }
+        if (changed) notifyGui();
+    });
 }
 
 void TerminalWindow::scheduleJobCheck(Tab& tab) {
@@ -668,7 +696,7 @@ void TerminalWindow::run() {
                     for (const auto& tab : tabs) {
                         if (tab->executor.hasJobs() || !tab->commandQueue.empty() ||
                             tab->hasPendingSubmission() ||
-                            tab->isProcessingCommand()) {
+                            tab->isProcessingCommand() || tab->isReadingOutput()) {
                             anyRunning = true;
                             break;
                         }
@@ -703,7 +731,7 @@ void TerminalWindow::run() {
 
         // Poll X11 and output pipes for all foreground/background jobs.
         std::vector<pollfd> fds;
-        std::vector<std::pair<Tab*, int>> monitored;
+        std::vector<Tab*> monitored;
         pollfd xfd{};
         xfd.fd = ConnectionNumber(display);
         xfd.events = POLLIN;
@@ -721,7 +749,7 @@ void TerminalWindow::run() {
                 fd.fd = fdNumber;
                 fd.events = POLLIN | POLLHUP;
                 fds.push_back(fd);
-                monitored.push_back({tab.get(), fdNumber});
+                monitored.push_back(tab.get());
             }
         }
         // A bounded timeout allows waitpid(WNOHANG|WUNTRACED) to detect
@@ -740,7 +768,7 @@ void TerminalWindow::run() {
         }
         for (size_t i = outputStart; i < fds.size(); ++i) {
             if (fds[i].revents & (POLLIN | POLLHUP | POLLERR))
-                readCommandOutput(*monitored[i - outputStart].first, monitored[i - outputStart].second);
+                scheduleOutputRead(*monitored[i - outputStart]);
         }
         // waitpid/job-status checks now run on the owning tab worker.
         for (auto& tab : tabs) scheduleJobCheck(*tab);
