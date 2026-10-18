@@ -33,6 +33,7 @@ private:
     void appendOutput(Tab& tab, const std::string& text);
     void readCommandOutput(Tab& tab, int fd);
     void updateJobs(Tab& tab);
+    void scheduleJobCheck(Tab& tab);
     void processCommandQueue(Tab& tab);
     void scheduleCommandProcessing(Tab& tab);
 

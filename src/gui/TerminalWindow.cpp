@@ -363,6 +363,26 @@ void TerminalWindow::updateJobs(Tab& tab) {
     }
 }
 
+void TerminalWindow::scheduleJobCheck(Tab& tab) {
+    // Called with stateMutex held by the GUI thread.
+    // Coalesce requests so the worker queue cannot grow without bound.
+    if (!tab.beginJobCheck()) return;
+    Tab* target = &tab;
+    tab.enqueueWorkerTask([this, target] {
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            const size_t oldLines = target->lines.size();
+            const bool wasRunning = target->executor.isRunning();
+            updateJobs(*target);
+            changed = oldLines != target->lines.size() ||
+                      wasRunning != target->executor.isRunning();
+            target->endJobCheck();
+        }
+        if (changed) notifyGui();
+    });
+}
+
 void TerminalWindow::scheduleCommandProcessing(Tab& tab) {
     // Caller owns stateMutex; worker will acquire it before touching shell state.
     if (tab.executor.isRunning() || tab.commandQueue.empty() ||
@@ -722,7 +742,8 @@ void TerminalWindow::run() {
             if (fds[i].revents & (POLLIN | POLLHUP | POLLERR))
                 readCommandOutput(*monitored[i - outputStart].first, monitored[i - outputStart].second);
         }
-        for (auto& tab : tabs) updateJobs(*tab);
+        // waitpid/job-status checks now run on the owning tab worker.
+        for (auto& tab : tabs) scheduleJobCheck(*tab);
         if (result > 0) redraw();
     }
 }

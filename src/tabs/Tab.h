@@ -26,6 +26,7 @@ private:
     std::deque<std::string> submittedCommands;
     std::atomic<unsigned> pendingSubmissions{0};
     std::atomic<bool> processingCommand{false};
+    std::atomic<bool> checkingJobs{false};
     std::function<void()> notifyGui;
 
     void workerLoop() {
@@ -96,6 +97,12 @@ public:
     }
     void endCommandProcessing() { processingCommand.store(false); }
     bool isProcessingCommand() const { return processingCommand.load(); }
+
+    bool beginJobCheck() {
+        bool expected = false;
+        return checkingJobs.compare_exchange_strong(expected, true);
+    }
+    void endJobCheck() { checkingJobs.store(false); }
 
     std::string input;
     std::string pendingOutput;
