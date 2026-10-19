@@ -10,17 +10,71 @@
 #include <poll.h>
 #include <cstring>
 
+// Task 4: parse redirection operators without passing them to execvp.
+// This is intentionally not the full Task 3 quoting/expansion parser.
+namespace {
+struct Redirection {
+    std::vector<std::string> args;
+    std::string input, output, error;
+};
+
+Redirection parseRedirection(const std::string& command) {
+    Redirection result;
+    std::vector<std::string> tokens;
+    std::string word;
+    char quote = 0;
+    bool started = false;
+    auto flush = [&]() {
+        if (started) { tokens.push_back(word); word.clear(); started = false; }
+    };
+    for (size_t i = 0; i < command.size(); ++i) {
+        char c = command[i];
+        if (quote) {
+            if (c == quote) { quote = 0; continue; }
+            if (quote == '"' && c == '\\' && i + 1 < command.size() &&
+                (command[i + 1] == '"' || command[i + 1] == '\\')) {
+                word += command[++i];
+            } else word += c;
+            started = true;
+        } else if (c == '\'' || c == '"') {
+            quote = c; started = true;
+        } else if (c == '\\' && i + 1 < command.size()) {
+            word += command[++i]; started = true;
+        } else if (c == '<' || c == '>') {
+            flush(); tokens.emplace_back(std::string(1, '\x1f') + c);
+        } else if (c == ' ' || c == '\t' || c == '\n') {
+            flush();
+        } else {
+            word += c; started = true;
+        }
+    }
+    if (quote) { result.error = "unterminated quote"; return result; }
+    flush();
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == "\x1f<" || tokens[i] == "\x1f>") {
+            bool input = tokens[i] == "\x1f<";
+            if (++i >= tokens.size() || tokens[i] == "\x1f<" || tokens[i] == "\x1f>") {
+                result.error = "missing filename after redirection"; return result;
+            }
+            (input ? result.input : result.output) = tokens[i];
+        } else result.args.push_back(tokens[i]);
+    }
+    if (result.args.empty()) result.error = "missing command";
+    return result;
+}
+}
+
 CommandExecutor::~CommandExecutor() { shutdown(); }
 
 bool CommandExecutor::start(const std::string& command, const std::string& cwd, bool background) {
     if (!background && isRunning()) return false;
-    std::istringstream stream(command);
-    std::vector<std::string> args;
-    std::string word;
-    while (stream >> word) args.push_back(word);
-    if (args.empty()) return false;
+    Redirection redirect = parseRedirection(command);
+    if (!redirect.error.empty()) {
+        fprintf(stderr, "terminator: %s\n", redirect.error.c_str());
+        return false;
+    }
     std::vector<char*> argv;
-    for (auto& a : args) argv.push_back(a.data());
+    for (auto& a : redirect.args) argv.push_back(a.data());
     argv.push_back(nullptr);
     int fds[2];
     if (pipe(fds) == -1) { perror("pipe"); return false; }
@@ -32,6 +86,26 @@ bool CommandExecutor::start(const std::string& command, const std::string& cwd, 
         if (chdir(cwd.c_str()) == -1) { perror("chdir"); _exit(127); }
         if (dup2(fds[1], STDOUT_FILENO) == -1 || dup2(fds[1], STDERR_FILENO) == -1) _exit(127);
         close(fds[1]);
+        if (!redirect.input.empty()) {
+            int inputFd = open(redirect.input.c_str(), O_RDONLY);
+            if (inputFd == -1) {
+                dprintf(STDERR_FILENO, "terminator: %s: %s\n",
+                        redirect.input.c_str(), strerror(errno));
+                _exit(1);
+            }
+            if (dup2(inputFd, STDIN_FILENO) == -1) { perror("dup2 stdin"); _exit(1); }
+            close(inputFd);
+        }
+        if (!redirect.output.empty()) {
+            int outputFd = open(redirect.output.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (outputFd == -1) {
+                dprintf(STDERR_FILENO, "terminator: %s: %s\n",
+                        redirect.output.c_str(), strerror(errno));
+                _exit(1);
+            }
+            if (dup2(outputFd, STDOUT_FILENO) == -1) { perror("dup2 stdout"); _exit(1); }
+            close(outputFd);
+        }
         execvp(argv[0], argv.data());
         if (errno == ENOENT) dprintf(STDERR_FILENO, "terminator: %s: command not found\n", argv[0]);
         else perror("execvp");

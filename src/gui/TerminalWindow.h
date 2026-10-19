@@ -23,6 +23,8 @@ private:
     void notifyGui() const;
 
     std::vector<std::unique_ptr<Tab>> tabs;
+    // Closed tabs are joined only while stateMutex is unlocked.
+    std::vector<std::unique_ptr<Tab>> retiredTabs;
     int activeTab = 0;
 
     void scroll(int amount); //scrolling function

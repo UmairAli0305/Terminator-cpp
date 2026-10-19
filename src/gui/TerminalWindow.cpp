@@ -41,6 +41,7 @@ TerminalWindow::TerminalWindow()
 TerminalWindow::~TerminalWindow() {
     // Workers must finish before the wake-up pipe is closed.
     tabs.clear();
+    retiredTabs.clear();
     if (wakeReadFd >= 0) close(wakeReadFd);
     if (wakeWriteFd >= 0) close(wakeWriteFd);
     if (display) {
@@ -117,6 +118,9 @@ void TerminalWindow::closeTab() {
         return;
     }
 
+    // Do not destroy/join the worker while holding stateMutex:
+    // the worker may be waiting for that same mutex.
+    retiredTabs.push_back(std::move(tabs[activeTab]));
     tabs.erase(tabs.begin() + activeTab);
 
     if (activeTab >= static_cast<int>(tabs.size()))
@@ -755,6 +759,9 @@ void TerminalWindow::run() {
         // A bounded timeout allows waitpid(WNOHANG|WUNTRACED) to detect
         // stopped/exited children even when their output pipe stays open.
         stateLock.unlock();
+        // Joining a retired worker under stateMutex deadlocks when that
+        // worker is waiting to acquire the mutex.
+        retiredTabs.clear();
         int result = poll(fds.data(), fds.size(), 10);
         stateLock.lock();
         if (result < 0) {
