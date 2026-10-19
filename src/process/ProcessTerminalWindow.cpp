@@ -1,4 +1,5 @@
 #include "AsyncProcessChannel.h"
+#include "../shell/MultilineInput.h"
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -15,6 +16,11 @@ struct ProcessTab {
     std::unique_ptr<AsyncProcessChannel> child;
     std::vector<std::string> lines{"Welcome to Terminator process mode"};
     std::string input;
+    std::vector<std::string> history;
+    std::string historyDraft;
+    size_t historyPosition = 0;
+    bool browsingHistory = false;
+    std::string multilinePending;
     bool busy = false;
 };
 void addOutput(ProcessTab& tab, const std::string& output) {
@@ -96,7 +102,7 @@ int runProcessWindow() {
                         static_cast<int>(tab.lines[i].size()));
         }
         std::string prompt = tab.busy ? "[command running...]" :
-                                           "user@terminator> " + tab.input + "_";
+                                           (tab.multilinePending.empty() ? "user@terminator> " : "> ") + tab.input + "_";
         XDrawString(display, window, gc, 20, y, prompt.c_str(),
                     static_cast<int>(prompt.size()));
         XFlush(display);
@@ -140,7 +146,7 @@ int runProcessWindow() {
                 } else if (key == XK_c || key == XK_C) {
                     tabs[active].lines.push_back(tabs[active].busy ?
                         "P6: Ctrl+C pending signal IPC." : "^C");
-                    if (!tabs[active].busy) tabs[active].input.clear();
+                    if (!tabs[active].busy) { tabs[active].input.clear(); tabs[active].multilinePending.clear(); }
                 } else if (key == XK_z || key == XK_Z) {
                     tabs[active].lines.push_back("P6: Ctrl+Z pending job-control IPC.");
                 }
@@ -149,19 +155,49 @@ int runProcessWindow() {
             }
             ProcessTab& tab = tabs[active];
             if (tab.busy) continue;
-            if (key == XK_BackSpace) {
+            if ((key == XK_Up || key == XK_Down) && tab.multilinePending.empty()) {
+                if (key == XK_Up && !tab.history.empty()) {
+                    if (!tab.browsingHistory) {
+                        tab.historyDraft = tab.input;
+                        tab.historyPosition = tab.history.size();
+                        tab.browsingHistory = true;
+                    }
+                    if (tab.historyPosition > 0) --tab.historyPosition;
+                    tab.input = tab.history[tab.historyPosition];
+                } else if (key == XK_Down && tab.browsingHistory) {
+                    if (tab.historyPosition + 1 < tab.history.size()) {
+                        ++tab.historyPosition;
+                        tab.input = tab.history[tab.historyPosition];
+                    } else {
+                        tab.input = tab.historyDraft;
+                        tab.browsingHistory = false;
+                    }
+                }
+            } else if (key == XK_BackSpace) {
                 if (!tab.input.empty()) tab.input.pop_back();
             } else if (key == XK_Return || key == XK_KP_Enter) {
-                if (tab.input == "exit") {
+                std::string command = tab.multilinePending;
+                tab.browsingHistory = false;
+                tab.historyDraft.clear();
+                MultilineInput::appendLine(command, tab.input);
+                tab.input.clear();
+                if (MultilineInput::needsMore(command)) {
+                    tab.multilinePending = std::move(command);
+                    dirty = true;
+                    continue;
+                }
+                tab.multilinePending.clear();
+                if (command == "exit") {
                     if (tabs.size() == 1) running = false;
                     else {
                         available.push_back(std::move(tab.child));
                         tabs.erase(tabs.begin() + static_cast<long>(active));
                         if (active >= tabs.size()) active = tabs.size() - 1;
                     }
-                } else if (!tab.input.empty()) {
-                    tab.lines.push_back("user@terminator> " + tab.input);
-                    if (!tab.child->submit(tab.input))
+                } else if (!command.empty()) {
+                    tab.history.push_back(command);
+                    tab.lines.push_back("user@terminator> " + command);
+                    if (!tab.child->submit(command))
                         tab.lines.push_back("Failed to send command.");
                     else tab.busy = true;
                     tab.input.clear();

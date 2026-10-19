@@ -113,6 +113,10 @@ public:
     bool isReadingOutput() const { return readingOutput.load(); }
 
     std::string input;
+    std::string historyDraft;
+    size_t historyPosition = 0;
+    bool browsingHistory = false;
+    std::string multilinePending;
     std::string pendingOutput;
     std::vector<std::string> lines;
     CommandExecutor executor;

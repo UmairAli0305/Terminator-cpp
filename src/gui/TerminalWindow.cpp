@@ -1,5 +1,6 @@
 
 #include "TerminalWindow.h"
+#include "../shell/MultilineInput.h"
 
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -222,9 +223,9 @@ void TerminalWindow::redraw() {
             if (tab.executor.isRunning()) {
                 line = "[command running...]";
             } else {
-                line = "user@terminator:" +
-                       tab.shell.getCwd().filename().string() +
-                       "> " + tab.input + "_";
+                line = (tab.multilinePending.empty() ?
+                       "user@terminator:" + tab.shell.getCwd().filename().string() + "> " :
+                       "> ") + tab.input + "_";
             }
         }
 
@@ -306,9 +307,9 @@ void TerminalWindow::redrawInputLine() { // optimization
     );
 
     std::string prompt =
-        "user@terminator:" +
-        tab.shell.getCwd().filename().string() +
-        "> " + tab.input + "_";
+        (tab.multilinePending.empty() ?
+        "user@terminator:" + tab.shell.getCwd().filename().string() + "> " :
+        "> ") + tab.input + "_";
 
     XDrawString(
         display,
@@ -595,7 +596,8 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
                 currentTab().lines.push_back("^C");
                 redraw();
             } else {
-                currentTab().input.clear(); redraw();
+                currentTab().input.clear(); currentTab().multilinePending.clear();
+                currentTab().browsingHistory = false; redraw();
             }
             return;
         }
@@ -619,6 +621,30 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
     Tab& tab = currentTab();
     if (tab.executor.isRunning() || !tab.commandQueue.empty() ||
         tab.hasPendingSubmission()) return;
+    // Navigate the shared command history with Up/Down arrows.
+    // Preserve what the user was typing before entering history browsing.
+    if ((key == XK_Up || key == XK_Down) && tab.multilinePending.empty()) {
+        if (key == XK_Up && !commandHistory.empty()) {
+            if (!tab.browsingHistory) {
+                tab.historyDraft = tab.input;
+                tab.historyPosition = commandHistory.size();
+                tab.browsingHistory = true;
+            }
+            if (tab.historyPosition > 0) --tab.historyPosition;
+            tab.input = commandHistory[tab.historyPosition];
+        } else if (key == XK_Down && tab.browsingHistory) {
+            if (tab.historyPosition + 1 < commandHistory.size()) {
+                ++tab.historyPosition;
+                tab.input = commandHistory[tab.historyPosition];
+            } else {
+                tab.input = tab.historyDraft;
+                tab.browsingHistory = false;
+            }
+        }
+        tab.scrollOffset = 0;
+        redraw();
+        return;
+    }
     bool wasScrolled = (tab.scrollOffset != 0);
     tab.scrollOffset = 0;
 
@@ -635,8 +661,17 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
         return;
     }
     else if (key == XK_Return || key == XK_KP_Enter) {
-        const std::string rawCommand = tab.input;
+        std::string rawCommand = tab.multilinePending;
+        tab.browsingHistory = false;
+        tab.historyDraft.clear();
+        MultilineInput::appendLine(rawCommand, tab.input);
         tab.input.clear();
+        if (MultilineInput::needsMore(rawCommand)) {
+            tab.multilinePending = std::move(rawCommand);
+            redraw();
+            return;
+        }
+        tab.multilinePending.clear();
         std::istringstream input(rawCommand);
         std::string name;
         input >> name;
