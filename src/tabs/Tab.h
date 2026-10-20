@@ -113,6 +113,7 @@ public:
     bool isReadingOutput() const { return readingOutput.load(); }
 
     std::string input;
+    size_t cursor = 0;
     std::string historyDraft;
     size_t historyPosition = 0;
     bool browsingHistory = false;

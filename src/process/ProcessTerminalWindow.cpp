@@ -1,3 +1,4 @@
+#include "../shell/LineEditing.h"
 #include "AsyncProcessChannel.h"
 #include "../shell/MultilineInput.h"
 #include <X11/Xlib.h>
@@ -16,6 +17,7 @@ struct ProcessTab {
     std::unique_ptr<AsyncProcessChannel> child;
     std::vector<std::string> lines{"Welcome to Terminator process mode"};
     std::string input;
+    size_t cursor = 0;
     std::vector<std::string> history;
     std::string historyDraft;
     size_t historyPosition = 0;
@@ -102,7 +104,7 @@ int runProcessWindow() {
                         static_cast<int>(tab.lines[i].size()));
         }
         std::string prompt = tab.busy ? "[command running...]" :
-                                           (tab.multilinePending.empty() ? "user@terminator> " : "> ") + tab.input + "_";
+                                           (tab.multilinePending.empty() ? "user@terminator> " : "> ") + LineEditing::display(tab.input, tab.cursor);
         XDrawString(display, window, gc, 20, y, prompt.c_str(),
                     static_cast<int>(prompt.size()));
         XFlush(display);
@@ -132,7 +134,8 @@ int runProcessWindow() {
                     else tabs[active].lines.push_back("Maximum 4 process tabs in P6.");
                 } else if (key == XK_Tab) {
                     active = (active + 1) % tabs.size();
-                } else if (key == XK_w || key == XK_W) {
+                } else if ((key == XK_w || key == XK_W) &&
+                           (event.xkey.state & ShiftMask)) {
                     if (tabs[active].busy) {
                         tabs[active].lines.push_back("Wait for command to finish before closing.");
                     } else if (tabs.size() > 1) {
@@ -143,13 +146,17 @@ int runProcessWindow() {
                     } else {
                         running = false;
                     }
+                } else if (LineEditing::apply(tabs[active].input, tabs[active].cursor,
+                                              key, true)) {
+                    // Input editing handled by the shared line editor.
                 } else if (key == XK_c || key == XK_C) {
                     if (tabs[active].busy) {
                         if (!tabs[active].child->interrupt())
                             tabs[active].lines.push_back("Unable to interrupt process child.");
                         else tabs[active].lines.push_back("^C");
                     } else tabs[active].lines.push_back("^C");
-                    if (!tabs[active].busy) { tabs[active].input.clear(); tabs[active].multilinePending.clear(); }
+                    if (!tabs[active].busy) { tabs[active].input.clear(); tabs[active].cursor = 0;
+                        tabs[active].multilinePending.clear(); }
                 } else if (key == XK_z || key == XK_Z) {
                     tabs[active].lines.push_back("P6: Ctrl+Z pending job-control IPC.");
                 }
@@ -167,23 +174,27 @@ int runProcessWindow() {
                     }
                     if (tab.historyPosition > 0) --tab.historyPosition;
                     tab.input = tab.history[tab.historyPosition];
+                    tab.cursor = tab.input.size();
                 } else if (key == XK_Down && tab.browsingHistory) {
                     if (tab.historyPosition + 1 < tab.history.size()) {
                         ++tab.historyPosition;
                         tab.input = tab.history[tab.historyPosition];
+                    tab.cursor = tab.input.size();
                     } else {
                         tab.input = tab.historyDraft;
+                        tab.cursor = tab.input.size();
                         tab.browsingHistory = false;
                     }
                 }
-            } else if (key == XK_BackSpace) {
-                if (!tab.input.empty()) tab.input.pop_back();
+            } else if (LineEditing::apply(tab.input, tab.cursor, key, false)) {
+                // Cursor motion, Backspace and Delete.
             } else if (key == XK_Return || key == XK_KP_Enter) {
                 std::string command = tab.multilinePending;
                 tab.browsingHistory = false;
                 tab.historyDraft.clear();
                 MultilineInput::appendLine(command, tab.input);
                 tab.input.clear();
+                tab.cursor = 0;
                 if (MultilineInput::needsMore(command)) {
                     tab.multilinePending = std::move(command);
                     dirty = true;
@@ -207,7 +218,8 @@ int runProcessWindow() {
                 }
             } else {
                 for (int i = 0; i < count; ++i)
-                    if (buffer[i] >= 32 && buffer[i] <= 126) tab.input += buffer[i];
+                    if (buffer[i] >= 32 && buffer[i] <= 126)
+                        LineEditing::insert(tab.input, tab.cursor, buffer[i]);
             }
             dirty = true;
         }

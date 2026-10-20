@@ -1,3 +1,4 @@
+#include "../shell/LineEditing.h"
 
 #include "TerminalWindow.h"
 #include "../shell/MultilineInput.h"
@@ -225,7 +226,7 @@ void TerminalWindow::redraw() {
             } else {
                 line = (tab.multilinePending.empty() ?
                        "user@terminator:" + tab.shell.getCwd().filename().string() + "> " :
-                       "> ") + tab.input + "_";
+                       "> ") + LineEditing::display(tab.input, tab.cursor);
             }
         }
 
@@ -309,7 +310,7 @@ void TerminalWindow::redrawInputLine() { // optimization
     std::string prompt =
         (tab.multilinePending.empty() ?
         "user@terminator:" + tab.shell.getCwd().filename().string() + "> " :
-        "> ") + tab.input + "_";
+        "> ") + LineEditing::display(tab.input, tab.cursor);
 
     XDrawString(
         display,
@@ -614,7 +615,8 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
                 currentTab().lines.push_back("^C");
                 redraw();
             } else {
-                currentTab().input.clear(); currentTab().multilinePending.clear();
+                currentTab().input.clear(); currentTab().cursor = 0;
+                currentTab().multilinePending.clear();
                 currentTab().browsingHistory = false; redraw();
             }
             return;
@@ -631,7 +633,8 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
         if (key == XK_Tab) {
             switchTab(); redraw(); return;
         }
-        if (key == XK_w || key == XK_W) {
+        // Ctrl+W edits the previous word; Ctrl+Shift+W closes the tab.
+        if ((key == XK_w || key == XK_W) && (event.state & ShiftMask)) {
             closeTab(); redraw(); return;
         }
     }
@@ -650,12 +653,15 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
             }
             if (tab.historyPosition > 0) --tab.historyPosition;
             tab.input = commandHistory[tab.historyPosition];
+            tab.cursor = tab.input.size();
         } else if (key == XK_Down && tab.browsingHistory) {
             if (tab.historyPosition + 1 < commandHistory.size()) {
                 ++tab.historyPosition;
                 tab.input = commandHistory[tab.historyPosition];
+            tab.cursor = tab.input.size();
             } else {
                 tab.input = tab.historyDraft;
+                tab.cursor = tab.input.size();
                 tab.browsingHistory = false;
             }
         }
@@ -666,10 +672,8 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
     bool wasScrolled = (tab.scrollOffset != 0);
     tab.scrollOffset = 0;
 
-    if (key == XK_BackSpace) {
-        if (!tab.input.empty()) {
-            tab.input.pop_back();
-        }
+    if (LineEditing::apply(tab.input, tab.cursor, key,
+                           (event.state & ControlMask) != 0)) {
 
         if (wasScrolled)
             redraw();
@@ -684,6 +688,7 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
         tab.historyDraft.clear();
         MultilineInput::appendLine(rawCommand, tab.input);
         tab.input.clear();
+        tab.cursor = 0;
         if (MultilineInput::needsMore(rawCommand)) {
             tab.multilinePending = std::move(rawCommand);
             redraw();
@@ -707,7 +712,7 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
             unsigned char ch = buffer[i];
 
             if (ch >= 32 && ch <= 126)
-                tab.input += static_cast<char>(ch);
+                LineEditing::insert(tab.input, tab.cursor, static_cast<char>(ch));
         }
 
         if (wasScrolled)
