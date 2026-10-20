@@ -144,8 +144,11 @@ int runProcessWindow() {
                         running = false;
                     }
                 } else if (key == XK_c || key == XK_C) {
-                    tabs[active].lines.push_back(tabs[active].busy ?
-                        "P6: Ctrl+C pending signal IPC." : "^C");
+                    if (tabs[active].busy) {
+                        if (!tabs[active].child->interrupt())
+                            tabs[active].lines.push_back("Unable to interrupt process child.");
+                        else tabs[active].lines.push_back("^C");
+                    } else tabs[active].lines.push_back("^C");
                     if (!tabs[active].busy) { tabs[active].input.clear(); tabs[active].multilinePending.clear(); }
                 } else if (key == XK_z || key == XK_Z) {
                     tabs[active].lines.push_back("P6: Ctrl+Z pending job-control IPC.");
@@ -210,8 +213,15 @@ int runProcessWindow() {
         }
         for (auto& tab : tabs) {
             for (auto& response : tab.child->takeReplies()) {
-                addOutput(tab, response.second);
-                tab.busy = false;
+                if (response.second == std::string("\x01DONE", 5)) {
+                    tab.busy = false;
+                } else {
+                    addOutput(tab, response.second);
+                    // multiWatch replies are streamed; the final DONE frame clears busy.
+                    if (response.first.rfind("multiWatch", 0) != 0 ||
+                        response.second.rfind("multiWatch:", 0) == 0)
+                        tab.busy = false;
+                }
                 dirty = true;
             }
             if (tab.child->hasFailed()) {

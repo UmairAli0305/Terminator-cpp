@@ -30,6 +30,7 @@ public:
     bool startProcess(); // fork before any GUI/IO threads exist
     bool startReader();  // start the communication thread afterwards
     bool submit(std::string command);
+    bool interrupt();
     std::deque<std::pair<std::string, std::string>> takeReplies();
     bool hasFailed();
     pid_t pid() const { return channel.pid(); }

@@ -9,8 +9,43 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <vector>
+#include <atomic>
 
 namespace {
+volatile sig_atomic_t interruptRequested = 0;
+extern "C" void processInterrupt(int) { interruptRequested = 1; }
+
+bool parseMultiWatch(const std::string& command, std::vector<std::string>& commands) {
+    const std::string prefix = "multiWatch";
+    if (command.compare(0, prefix.size(), prefix) != 0) return false;
+    size_t pos = command.find_first_not_of(" \t", prefix.size());
+    if (pos == std::string::npos || command[pos++] != '[') return false;
+    for (;;) {
+        pos = command.find_first_not_of(" \t", pos);
+        if (pos == std::string::npos) return false;
+        if (command[pos] == ']') {
+            ++pos;
+            return !commands.empty() && command.find_first_not_of(" \t", pos) == std::string::npos;
+        }
+        if (command[pos++] != '"') return false;
+        std::string item;
+        bool closed = false;
+        while (pos < command.size()) {
+            char c = command[pos++];
+            if (c == '"') { closed = true; break; }
+            if (c == '\\' && pos < command.size() && command[pos] == '"') c = command[pos++];
+            item.push_back(c);
+        }
+        if (!closed || item.empty()) return false;
+        commands.push_back(item);
+        pos = command.find_first_not_of(" \t", pos);
+        if (pos == std::string::npos) return false;
+        if (command[pos] == ',') { ++pos; continue; }
+        if (command[pos] != ']') return false;
+    }
+}
+
 bool writeAll(int fd, const void* data, size_t length) {
     auto* p = static_cast<const char*>(data);
     while (length) {
@@ -69,6 +104,10 @@ bool ProcessChannel::start() {
             if (fd != toChild[0] && fd != fromChild[1]) close(fd);
         }
         // IPC transport test only; shell execution is added in a later stage.
+        struct sigaction action{};
+        action.sa_handler = processInterrupt;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGUSR1, &action, nullptr);
         ShellSession shell;
         std::string request;
         while (readFrame(toChild[0], request)) {
@@ -76,6 +115,45 @@ bool ProcessChannel::start() {
             // Legacy raw messages still echo for the P1 transport test.
             std::string reply = request;
             if (request.rfind("CMD ", 0) == 0) {
+                interruptRequested = 0;
+                const std::string command = request.substr(4);
+                if (command.rfind("multiWatch", 0) == 0) {
+                    std::vector<std::string> commands;
+                    if (!parseMultiWatch(command, commands)) {
+                        if (!sendFrame(fromChild[1], "multiWatch: usage: multiWatch [\"cmd1\", \"cmd2\"]")) break;
+                        continue;
+                    }
+                    CommandExecutor executor;
+                    if (!executor.startMultiWatch(commands, shell.getCwd().string())) {
+                        if (!sendFrame(fromChild[1], "multiWatch: unable to start")) break;
+                        continue;
+                    }
+                    bool connected = true;
+                    while (executor.hasJobs() && !interruptRequested && connected) {
+                        auto fds = executor.outputFds();
+                        std::vector<pollfd> watched;
+                        for (int fd : fds) { pollfd p{}; p.fd = fd; p.events = POLLIN | POLLHUP; watched.push_back(p); }
+                        int ready = poll(watched.data(), watched.size(), 100);
+                        if (ready < 0 && errno != EINTR) break;
+                        if (ready > 0) for (const auto& entry : watched) {
+                            if (entry.revents & (POLLIN | POLLHUP | POLLERR)) {
+                                std::string chunk = executor.readOutput(entry.fd);
+                                // Send chunks immediately, not after multiWatch exits.
+                                for (size_t i = 0; i < chunk.size(); i += 32000) {
+                                    if (!sendFrame(fromChild[1], std::string("\x01MORE", 5) + chunk.substr(i, 32000))) {
+                                        connected = false; break;
+                                    }
+                                }
+                            }
+                        }
+                        executor.update();
+                    }
+                    if (interruptRequested) executor.signalForeground(SIGINT);
+                    executor.shutdown();
+                    interruptRequested = 0;
+                    if (!connected || !sendFrame(fromChild[1], std::string("\x01DONE", 5))) break;
+                    continue;
+                }
                 std::istringstream input(request.substr(4));
                 std::string operation;
                 input >> operation;

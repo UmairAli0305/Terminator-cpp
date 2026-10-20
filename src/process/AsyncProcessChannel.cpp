@@ -1,4 +1,5 @@
 #include "AsyncProcessChannel.h"
+#include <signal.h>
 
 AsyncProcessChannel::~AsyncProcessChannel() {
     {
@@ -48,9 +49,22 @@ void AsyncProcessChannel::run() {
             failed = true;
             break;
         }
+        if (command.rfind("multiWatch", 0) == 0 && output.compare(0, 5, "\x01MORE", 5) == 0) {
+            while (output.compare(0, 5, "\x01MORE", 5) == 0) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    replies.emplace_back(command, output.substr(5));
+                }
+                if (!channel.receive(output)) {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    failed = true;
+                    return;
+                }
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(mutex);
-            replies.emplace_back(std::move(command), std::move(output));
+            replies.emplace_back(std::move(command), output == std::string("\x01DONE", 5) ? std::string("\x01DONE", 5) : std::move(output));
         }
     }
 }
@@ -65,4 +79,8 @@ std::deque<std::pair<std::string, std::string>> AsyncProcessChannel::takeReplies
 bool AsyncProcessChannel::hasFailed() {
     std::lock_guard<std::mutex> lock(mutex);
     return failed;
+}
+
+bool AsyncProcessChannel::interrupt() {
+    return channel.pid() > 0 && kill(channel.pid(), SIGUSR1) == 0;
 }
