@@ -264,6 +264,110 @@ CommandExecutor::~CommandExecutor() { shutdown(); }
 
 bool CommandExecutor::start(const std::string& command, const std::string& cwd, bool background) {
     if (!background && isRunning()) return false;
+    // Task 5: ordinary top-level pipelines (not only $(...) substitutions).
+    // A coordinator owns the pipeline children and belongs to their process group.
+    std::vector<std::string> stages;
+    std::string pipelineError;
+    if (!splitPipeline(command, stages, pipelineError)) {
+        fprintf(stderr, "terminator: %s\n", pipelineError.c_str());
+        return false;
+    }
+    if (stages.size() > 1) {
+        std::vector<Redirection> parsed;
+        for (const auto& stage : stages) {
+            Redirection r = parseRedirection(stage, cwd);
+            if (!r.error.empty() || r.args.empty()) {
+                fprintf(stderr, "terminator: %s\n", r.error.empty() ? "empty pipeline command" : r.error.c_str());
+                return false;
+            }
+            parsed.push_back(std::move(r));
+        }
+        int capture[2];
+        if (pipe(capture) == -1) { perror("pipe"); return false; }
+        pid_t coordinator = fork();
+        if (coordinator == -1) {
+            perror("fork"); close(capture[0]); close(capture[1]); return false;
+        }
+        if (coordinator == 0) {
+            close(capture[0]);
+            setpgid(0, 0);
+            if (chdir(cwd.c_str()) == -1) _exit(127);
+            int previousRead = -1;
+            std::vector<pid_t> children;
+            bool failed = false;
+            for (size_t i = 0; i < parsed.size(); ++i) {
+                int next[2] = {-1, -1};
+                if (i + 1 < parsed.size() && pipe(next) == -1) {
+                    dprintf(capture[1], "terminator: pipe: %s\n", strerror(errno));
+                    failed = true; break;
+                }
+                pid_t child = fork();
+                if (child == -1) {
+                    dprintf(capture[1], "terminator: fork: %s\n", strerror(errno));
+                    if (next[0] >= 0) close(next[0]);
+                    if (next[1] >= 0) close(next[1]);
+                    failed = true; break;
+                }
+                if (child == 0) {
+                    if (previousRead >= 0 && dup2(previousRead, STDIN_FILENO) == -1) _exit(127);
+                    if (i + 1 < parsed.size()) {
+                        close(next[0]);
+                        if (dup2(next[1], STDOUT_FILENO) == -1) _exit(127);
+                    } else if (dup2(capture[1], STDOUT_FILENO) == -1) _exit(127);
+                    if (dup2(capture[1], STDERR_FILENO) == -1) _exit(127);
+                    if (previousRead >= 0) close(previousRead);
+                    if (next[1] >= 0) close(next[1]);
+                    close(capture[1]);
+                    const Redirection& r = parsed[i];
+                    if (!r.input.empty()) {
+                        int fd = open(r.input.c_str(), O_RDONLY);
+                        if (fd == -1) {
+                            dprintf(STDERR_FILENO, "terminator: %s: %s\n", r.input.c_str(), strerror(errno));
+                            _exit(1);
+                        }
+                        if (dup2(fd, STDIN_FILENO) == -1) _exit(1);
+                        close(fd);
+                    }
+                    if (!r.output.empty()) {
+                        int fd = open(r.output.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                        if (fd == -1) {
+                            dprintf(STDERR_FILENO, "terminator: %s: %s\n", r.output.c_str(), strerror(errno));
+                            _exit(1);
+                        }
+                        if (dup2(fd, STDOUT_FILENO) == -1) _exit(1);
+                        close(fd);
+                    }
+                    std::vector<char*> argv;
+                    for (const auto& a : r.args) argv.push_back(const_cast<char*>(a.c_str()));
+                    argv.push_back(nullptr);
+                    execvp(argv[0], argv.data());
+                    dprintf(STDERR_FILENO, "terminator: %s: %s\n", argv[0], strerror(errno));
+                    _exit(errno == ENOENT ? 127 : 126);
+                }
+                children.push_back(child);
+                if (previousRead >= 0) close(previousRead);
+                if (next[1] >= 0) close(next[1]);
+                previousRead = next[0];
+            }
+            if (previousRead >= 0) close(previousRead);
+            close(capture[1]);
+            int result = failed ? 1 : 0;
+            for (pid_t child : children) {
+                int status = 0;
+                pid_t w;
+                do { w = waitpid(child, &status, 0); } while (w == -1 && errno == EINTR);
+                if (w == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) result = 1;
+            }
+            _exit(result);
+        }
+        close(capture[1]);
+        if (setpgid(coordinator, coordinator) == -1 && errno != EACCES && errno != ESRCH)
+            perror("setpgid");
+        int flags = fcntl(capture[0], F_GETFL);
+        if (flags != -1) fcntl(capture[0], F_SETFL, flags | O_NONBLOCK);
+        active.push_back({nextId++, coordinator, capture[0], command, State::Running, !background});
+        return true;
+    }
     Redirection redirect = parseRedirection(command, cwd);
     if (!redirect.error.empty()) {
         fprintf(stderr, "terminator: %s\n", redirect.error.c_str());
