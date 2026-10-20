@@ -11,6 +11,8 @@
 #include <cstring>
 #include <cctype>
 #include <cstdlib>
+#include <ctime>
+#include <chrono>
 
 // Task 4: parse redirection operators without passing them to execvp.
 // This is intentionally not the full Task 3 quoting/expansion parser.
@@ -420,8 +422,8 @@ bool CommandExecutor::start(const std::string& command, const std::string& cwd, 
     return true;
 }
 
-// One-shot multiWatch coordinator. The coordinator and its commands share a
-// process group, so the existing Ctrl+C/Ctrl+Z job-control code works.
+// MultiWatch coordinator runs in its own process group.  Every watched command
+// is started in that group so Ctrl+C reaches all descendants.
 bool CommandExecutor::startMultiWatch(const std::vector<std::string>& commands,
                                      const std::string& cwd) {
     if (commands.empty() || isRunning()) return false;
@@ -434,84 +436,200 @@ bool CommandExecutor::startMultiWatch(const std::vector<std::string>& commands,
     if (coordinator == 0) {
         close(outputPipe[0]);
         setpgid(0, 0);
+        signal(SIGINT, SIG_DFL);
         if (chdir(cwd.c_str()) == -1) { perror("chdir"); _exit(1); }
         if (dup2(outputPipe[1], STDOUT_FILENO) == -1 ||
             dup2(outputPipe[1], STDERR_FILENO) == -1) _exit(1);
         close(outputPipe[1]);
 
-        struct Child { pid_t pid; int fd; std::string name; bool open; };
-        std::vector<Child> children;
-        for (const std::string& cmd : commands) {
-            std::istringstream words(cmd);
-            std::vector<std::string> args;
-            std::string word;
-            while (words >> word) args.push_back(word);
-            if (args.empty()) continue;
-            int p[2];
-            if (pipe(p) == -1) { perror("multiWatch pipe"); continue; }
-            pid_t pid = fork();
-            if (pid == -1) { perror("multiWatch fork"); close(p[0]); close(p[1]); continue; }
-            if (pid == 0) {
-                close(p[0]);
-                if (dup2(p[1], STDOUT_FILENO) == -1 ||
-                    dup2(p[1], STDERR_FILENO) == -1) _exit(1);
-                close(p[1]);
-                std::vector<char*> argv;
-                for (auto& arg : args) argv.push_back(arg.data());
-                argv.push_back(nullptr);
-                execvp(argv[0], argv.data());
-                if (errno == ENOENT)
-                    dprintf(STDERR_FILENO, "terminator: %s: command not found\n", argv[0]);
-                else perror("execvp");
-                _exit(errno == ENOENT ? 127 : 126);
-            }
-            close(p[1]);
-            children.push_back({pid, p[0], cmd, true});
+        using Clock = std::chrono::steady_clock;
+        struct Watch {
+            std::string name;
+            pid_t pid = -1;
+            int fd = -1;
+            Clock::time_point next;
+            std::string pending;
+        };
+        std::vector<Watch> watches;
+        for (const auto& command : commands) {
+            Watch w; w.name = command;
+            if (command.find_first_not_of(" \t") == std::string::npos) continue;
+            w.next = Clock::now();
+            watches.push_back(std::move(w));
         }
-        dprintf(STDOUT_FILENO, "[multiWatch] Monitoring %zu commands\n", children.size());
-        size_t openCount = children.size();
-        while (openCount > 0) {
+        if (watches.empty()) _exit(1);
+        const char* divider = "----------------------------------------------------\n";
+        auto emit = [&](Watch& w, const std::string& output) {
+            if (output.empty()) return;
+            dprintf(STDOUT_FILENO, "\"%s\", %lld:\n%s", w.name.c_str(),
+                    static_cast<long long>(time(nullptr)), divider);
+            const char* p = output.data(); size_t left = output.size();
+            while (left) {
+                ssize_t n = write(STDOUT_FILENO, p, left);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                p += n; left -= static_cast<size_t>(n);
+            }
+            if (output.back() != '\n') dprintf(STDOUT_FILENO, "\n");
+            dprintf(STDOUT_FILENO, "%s", divider);
+        };
+        while (true) {
+            auto now = Clock::now();
+            for (auto& w : watches) {
+                if (w.pid != -1 || now < w.next) continue;
+                int p[2];
+                if (pipe(p) == -1) { perror("multiWatch pipe"); w.next = now + std::chrono::seconds(2); continue; }
+                pid_t pid = fork();
+                if (pid == -1) {
+                    perror("multiWatch fork"); close(p[0]); close(p[1]);
+                    w.next = now + std::chrono::seconds(2); continue;
+                }
+                if (pid == 0) {
+                    close(p[0]);
+                    // A watcher must not retain other watchers' read ends.
+                    for (const auto& other : watches)
+                        if (other.fd >= 0) close(other.fd);
+                    setpgid(0, getpgrp());
+                    if (dup2(p[1], STDOUT_FILENO) == -1 ||
+                        dup2(p[1], STDERR_FILENO) == -1) _exit(1);
+                    close(p[1]);
+
+                    // A watched expression may itself be a pipeline. Run its
+                    // stages concurrently with N-1 connecting pipes; do not
+                    // pass a command string to a shell.
+                    std::vector<std::string> stages;
+                    std::string error;
+                    if (!splitPipeline(w.name, stages, error)) {
+                        dprintf(STDERR_FILENO, "multiWatch: %s\n", error.c_str());
+                        _exit(1);
+                    }
+                    std::vector<Redirection> parsed;
+                    for (const auto& stage : stages) {
+                        Redirection cmd = parseRedirection(stage, cwd);
+                        if (!cmd.error.empty() || cmd.args.empty()) {
+                            dprintf(STDERR_FILENO, "multiWatch: %s\n",
+                                    cmd.error.empty() ? "empty command" : cmd.error.c_str());
+                            _exit(1);
+                        }
+                        parsed.push_back(std::move(cmd));
+                    }
+                    int previous = -1;
+                    std::vector<pid_t> children;
+                    bool failed = false;
+                    for (size_t stage = 0; stage < parsed.size(); ++stage) {
+                        int next[2] = {-1, -1};
+                        if (stage + 1 < parsed.size() && pipe(next) == -1) {
+                            dprintf(STDERR_FILENO, "multiWatch: pipe: %s\n", strerror(errno));
+                            failed = true; break;
+                        }
+                        pid_t worker = fork();
+                        if (worker == -1) {
+                            dprintf(STDERR_FILENO, "multiWatch: fork: %s\n", strerror(errno));
+                            if (next[0] >= 0) close(next[0]);
+                            if (next[1] >= 0) close(next[1]);
+                            failed = true; break;
+                        }
+                        if (worker == 0) {
+                            if (previous >= 0 && dup2(previous, STDIN_FILENO) == -1) _exit(1);
+                            if (next[1] >= 0 && dup2(next[1], STDOUT_FILENO) == -1) _exit(1);
+                            if (previous >= 0) close(previous);
+                            if (next[0] >= 0) close(next[0]);
+                            if (next[1] >= 0) close(next[1]);
+                            const auto& cmd = parsed[stage];
+                            if (!cmd.input.empty()) {
+                                int fd = open(cmd.input.c_str(), O_RDONLY);
+                                if (fd < 0) {
+                                    dprintf(STDERR_FILENO, "multiWatch: %s: %s\n",
+                                            cmd.input.c_str(), strerror(errno));
+                                    _exit(1);
+                                }
+                                if (dup2(fd, STDIN_FILENO) == -1) _exit(1);
+                                close(fd);
+                            }
+                            if (!cmd.output.empty()) {
+                                int fd = open(cmd.output.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+                                if (fd < 0) {
+                                    dprintf(STDERR_FILENO, "multiWatch: %s: %s\n",
+                                            cmd.output.c_str(), strerror(errno));
+                                    _exit(1);
+                                }
+                                if (dup2(fd, STDOUT_FILENO) == -1) _exit(1);
+                                close(fd);
+                            }
+                            std::vector<char*> argv;
+                            for (const auto& arg : cmd.args)
+                                argv.push_back(const_cast<char*>(arg.c_str()));
+                            argv.push_back(nullptr);
+                            execvp(argv[0], argv.data());
+                            dprintf(STDERR_FILENO, "multiWatch: %s: %s\n", argv[0], strerror(errno));
+                            _exit(127);
+                        }
+                        children.push_back(worker);
+                        if (previous >= 0) close(previous);
+                        if (next[1] >= 0) close(next[1]);
+                        previous = next[0];
+                    }
+                    if (previous >= 0) close(previous);
+                    // Only the actual command children should keep the output
+                    // pipe open. Closing our copies ensures timely EOF.
+                    close(STDOUT_FILENO);
+                    close(STDERR_FILENO);
+                    for (pid_t child : children) {
+                        int status = 0;
+                        pid_t waited;
+                        do { waited = waitpid(child, &status, 0); }
+                        while (waited == -1 && errno == EINTR);
+                        if (waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+                            failed = true;
+                    }
+                    _exit(failed ? 1 : 0);
+                }
+                setpgid(pid, getpgrp());
+                close(p[1]);
+                w.pid = pid; w.fd = p[0]; w.pending.clear();
+            }
             std::vector<pollfd> fds;
             std::vector<size_t> indexes;
-            for (size_t i = 0; i < children.size(); ++i) {
-                if (children[i].open) {
-                    pollfd p{}; p.fd = children[i].fd; p.events = POLLIN | POLLHUP;
-                    fds.push_back(p); indexes.push_back(i);
+            int timeout = 2000;
+            now = Clock::now();
+            for (size_t i = 0; i < watches.size(); ++i) {
+                auto& w = watches[i];
+                if (w.fd >= 0) {
+                    pollfd f{}; f.fd = w.fd; f.events = POLLIN | POLLHUP;
+                    fds.push_back(f); indexes.push_back(i);
+                } else if (w.pid == -1) {
+                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(w.next - now).count();
+                    if (ms < 0) ms = 0;
+                    timeout = std::min(timeout, static_cast<int>(ms));
                 }
             }
-            int ready = poll(fds.data(), fds.size(), -1);
+            int ready = poll(fds.data(), fds.size(), timeout);
             if (ready < 0) { if (errno == EINTR) continue; break; }
             for (size_t i = 0; i < fds.size(); ++i) {
                 if (!(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
-                Child& child = children[indexes[i]];
+                Watch& w = watches[indexes[i]];
                 char buffer[4096];
-                ssize_t n = read(child.fd, buffer, sizeof(buffer));
+                ssize_t n = read(w.fd, buffer, sizeof(buffer));
                 if (n > 0) {
-                    dprintf(STDOUT_FILENO, "[%s] ", child.name.c_str());
-                    // Output can contain embedded newlines; print as one chunk.
-                    ssize_t written = 0;
-                    while (written < n) {
-                        ssize_t w = write(STDOUT_FILENO, buffer + written, static_cast<size_t>(n - written));
-                        if (w < 0 && errno == EINTR) continue;
-                        if (w <= 0) break;
-                        written += w;
+                    w.pending.append(buffer, static_cast<size_t>(n));
+                    // Emit all complete lines available in this read as one
+                    // block, preserving the professor's header/divider format.
+                    size_t end = w.pending.rfind('\n');
+                    if (end != std::string::npos) {
+                        emit(w, w.pending.substr(0, end + 1));
+                        w.pending.erase(0, end + 1);
                     }
-                    if (buffer[n - 1] != '\n') dprintf(STDOUT_FILENO, "\n");
                 } else if (n == 0 || (n < 0 && errno != EINTR)) {
-                    close(child.fd); child.open = false; --openCount;
+                    emit(w, w.pending); w.pending.clear();
+                    close(w.fd); w.fd = -1;
+                    int status = 0;
+                    while (waitpid(w.pid, &status, 0) == -1 && errno == EINTR) {}
+                    w.pid = -1;
+                    w.next = Clock::now() + std::chrono::seconds(2);
                 }
             }
         }
-        int finalStatus = 0;
-        for (auto& child : children) {
-            if (child.open) close(child.fd);
-            int status = 0;
-            pid_t result;
-            do { result = waitpid(child.pid, &status, 0); } while (result == -1 && errno == EINTR);
-            if (result == -1 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) finalStatus = 1;
-        }
-        dprintf(STDOUT_FILENO, "[multiWatch] All commands completed\n");
-        _exit(finalStatus);
+        _exit(1);
     }
     close(outputPipe[1]);
     if (setpgid(coordinator, coordinator) == -1 && errno != EACCES && errno != ESRCH)

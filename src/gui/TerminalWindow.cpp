@@ -494,27 +494,45 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
         }
         else if (name == "multiWatch") {
             std::vector<std::string> commands;
-            std::string current;
-            bool inQuotes = false;
-            bool invalid = false;
             std::string rest;
             std::getline(stream, rest);
-            for (char c : rest) {
-                if (c == '"') {
-                    if (inQuotes) {
-                        if (current.empty()) invalid = true;
-                        else commands.push_back(current);
-                        current.clear();
+            size_t pos = rest.find_first_not_of(" \t");
+            bool invalid = pos == std::string::npos || rest[pos] != '[';
+            if (!invalid) {
+                ++pos;
+                while (true) {
+                    pos = rest.find_first_not_of(" \t", pos);
+                    if (pos == std::string::npos) { invalid = true; break; }
+                    if (rest[pos] == ']') {
+                        ++pos;
+                        if (rest.find_first_not_of(" \t", pos) != std::string::npos) invalid = true;
+                        break;
                     }
-                    inQuotes = !inQuotes;
-                } else if (inQuotes) {
-                    current += c;
-                } else if (c != ' ' && c != '\t') {
-                    invalid = true;
+                    if (rest[pos] != '"') { invalid = true; break; }
+                    ++pos;
+                    std::string command;
+                    bool closed = false;
+                    while (pos < rest.size()) {
+                        char c = rest[pos++];
+                        if (c == '"') { closed = true; break; }
+                        if (c == '\\' && pos < rest.size() && rest[pos] == '"') c = rest[pos++];
+                        command.push_back(c);
+                    }
+                    if (!closed || command.empty()) { invalid = true; break; }
+                    commands.push_back(command);
+                    pos = rest.find_first_not_of(" \t", pos);
+                    if (pos == std::string::npos) { invalid = true; break; }
+                    if (rest[pos] == ',') { ++pos; continue; }
+                    if (rest[pos] == ']') {
+                        ++pos;
+                        if (rest.find_first_not_of(" \t", pos) != std::string::npos) invalid = true;
+                        break;
+                    }
+                    invalid = true; break;
                 }
             }
-            if (inQuotes || invalid || commands.empty()) {
-                tab.lines.push_back("multiWatch: usage: multiWatch \"command1\" \"command2\" ...");
+            if (invalid || commands.empty()) {
+                tab.lines.push_back("multiWatch: usage: multiWatch [\"command1\", \"command2\"]");
                 tab.shell.setLastStatus(1);
             } else if (!tab.executor.startMultiWatch(commands, tab.shell.getCwd().string())) {
                 tab.lines.push_back("multiWatch: unable to start");
