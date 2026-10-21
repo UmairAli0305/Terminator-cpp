@@ -1,3 +1,4 @@
+#include "../shell/FilenameCompletion.h"
 #include "../shell/HistorySearch.h"
 #include "../shell/HotkeyConfig.h"
 #include "../shell/LineEditing.h"
@@ -713,8 +714,36 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
         }
         return;
     }
+    if (tab.completionChoice.active()) {
+        int picked = tab.completionChoice.key(key, buffer, count);
+        if (picked >= 0) {
+            FilenameCompletion::choose(tab.input, tab.cursor,
+                tab.completionChoice.directory,
+                tab.completionChoice.matches[static_cast<size_t>(picked)]);
+            tab.completionChoice.clear();
+            redrawInputLine();
+        } else if (picked == -2) {
+            redrawInputLine();
+        }
+        return;
+    }
     if (tab.executor.isRunning() || !tab.commandQueue.empty() ||
         tab.hasPendingSubmission()) return;
+    if (key == XK_Tab && !(event.state & ControlMask)) {
+        const bool wasScrolled = tab.scrollOffset != 0;
+        tab.scrollOffset = 0;
+        auto result = FilenameCompletion::complete(tab.input, tab.cursor, tab.shell.getCwd());
+        if (result.ambiguous) {
+            tab.completionChoice.matches = std::move(result.matches);
+            tab.completionChoice.directory = std::move(result.directory);
+            tab.completionChoice.digits.clear();
+            for (size_t i = 0; i < tab.completionChoice.matches.size(); ++i)
+                tab.lines.push_back(std::to_string(i + 1) + ". " +
+                                    tab.completionChoice.matches[i]);
+            redraw();
+        } else if (wasScrolled) redraw(); else redrawInputLine();
+        return;
+    }
     // Navigate the shared command history with Up/Down arrows.
     // Preserve what the user was typing before entering history browsing.
     if ((key == XK_Up || key == XK_Down) && tab.multilinePending.empty()) {

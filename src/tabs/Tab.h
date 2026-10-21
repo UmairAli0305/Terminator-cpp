@@ -2,6 +2,7 @@
 #ifndef TAB_H
 #define TAB_H
 #include "../shell/ShellSession.h"
+#include "../shell/CompletionChoice.h"
 #include "../shell/CommandExecutor.h"
 
 #include <atomic>
@@ -112,6 +113,7 @@ public:
     void endOutputRead() { readingOutput.store(false); }
     bool isReadingOutput() const { return readingOutput.load(); }
 
+    CompletionChoice completionChoice;
     std::string input;
     size_t cursor = 0;
     bool searchingHistory = false;

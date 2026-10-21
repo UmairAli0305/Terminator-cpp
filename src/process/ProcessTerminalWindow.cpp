@@ -1,3 +1,7 @@
+#include "../shell/FilenameCompletion.h"
+#include "../shell/CompletionChoice.h"
+#include <filesystem>
+#include <cstdlib>
 #include "../shell/HistorySearch.h"
 #include "../shell/HotkeyConfig.h"
 #include "../shell/LineEditing.h"
@@ -21,7 +25,9 @@ constexpr int MAX_TABS = 4;
 struct ProcessTab {
     std::unique_ptr<AsyncProcessChannel> child;
     std::vector<std::string> lines{"Welcome to Terminator process mode"};
+    CompletionChoice completionChoice;
     std::string input;
+    std::filesystem::path completionCwd = std::filesystem::current_path();
     size_t cursor = 0;
     std::vector<std::string> history;
     std::string historyDraft;
@@ -221,6 +227,18 @@ int runProcessWindow() {
                 }
                 continue;
             }
+            if (tabs[active].completionChoice.active()) {
+                ProcessTab& tab = tabs[active];
+                int picked = tab.completionChoice.key(key, buffer, count);
+                if (picked >= 0) {
+                    FilenameCompletion::choose(tab.input, tab.cursor,
+                        tab.completionChoice.directory,
+                        tab.completionChoice.matches[static_cast<size_t>(picked)]);
+                    tab.completionChoice.clear();
+                    inputDirty = true;
+                } else if (picked == -2) inputDirty = true;
+                continue;
+            }
             if (key == XK_Escape) {
                 bool anyBusy = false;
                 for (const auto& tab : tabs) anyBusy |= tab.busy;
@@ -322,6 +340,17 @@ int runProcessWindow() {
                         tab.browsingHistory = false;
                     }
                 }
+            } else if (key == XK_Tab) {
+                auto result = FilenameCompletion::complete(tab.input, tab.cursor, tab.completionCwd);
+                if (result.ambiguous) {
+                    tab.completionChoice.matches = std::move(result.matches);
+                    tab.completionChoice.directory = std::move(result.directory);
+                    tab.completionChoice.digits.clear();
+                    for (size_t i = 0; i < tab.completionChoice.matches.size(); ++i)
+                        tab.lines.push_back(std::to_string(i + 1) + ". " +
+                                            tab.completionChoice.matches[i]);
+                    dirty = true;
+                }
             } else if (LineEditing::apply(tab.input, tab.cursor, key, false)) {
                 // Cursor motion, Backspace and Delete.
             } else if (key == XK_Return || key == XK_KP_Enter) {
@@ -346,6 +375,23 @@ int runProcessWindow() {
                         if (active >= tabs.size()) active = tabs.size() - 1;
                     }
                 } else if (!command.empty()) {
+                    // Mirror straightforward cd commands for GUI-side file completion.
+                    // The child validates and executes the actual cd separately.
+                    if (command == "cd" || command.rfind("cd ", 0) == 0) {
+                        std::string dest = command == "cd" ? "" : command.substr(3);
+                        if (dest.empty() || dest == "~") {
+                            const char* home = std::getenv("HOME");
+                            if (home) dest = home;
+                        }
+                        if (!dest.empty()) {
+                            std::filesystem::path next(dest);
+                            if (next.is_relative()) next = tab.completionCwd / next;
+                            std::error_code ec;
+                            auto normalized = std::filesystem::weakly_canonical(next, ec);
+                            if (!ec && std::filesystem::is_directory(normalized, ec) && !ec)
+                                tab.completionCwd = normalized;
+                        }
+                    }
                     SharedHistory::append(command);
                     tab.history = SharedHistory::load();
                     tab.lines.push_back("user@terminator> " + command);
