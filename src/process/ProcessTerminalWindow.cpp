@@ -243,7 +243,11 @@ int runProcessWindow() {
                     if (!tabs[active].busy) { tabs[active].input.clear(); tabs[active].cursor = 0;
                         tabs[active].multilinePending.clear(); }
                 } else if (key == XK_z || key == XK_Z) {
-                    tabs[active].lines.push_back("P6: Ctrl+Z pending job-control IPC.");
+                    if (tabs[active].busy) {
+                        if (!tabs[active].child->suspend())
+                            tabs[active].lines.push_back("Unable to suspend process child.");
+                        else tabs[active].lines.push_back("^Z");
+                    }
                 }
                 if (!inputDirty) dirty = true;
                 continue;

@@ -31,6 +31,7 @@ public:
     bool startReader();  // start the communication thread afterwards
     bool submit(std::string command);
     bool interrupt();
+    bool suspend();
     std::deque<std::pair<std::string, std::string>> takeReplies();
     bool hasFailed();
     pid_t pid() const { return channel.pid(); }

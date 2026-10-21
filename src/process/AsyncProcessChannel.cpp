@@ -84,3 +84,6 @@ bool AsyncProcessChannel::hasFailed() {
 bool AsyncProcessChannel::interrupt() {
     return channel.pid() > 0 && kill(channel.pid(), SIGUSR1) == 0;
 }
+bool AsyncProcessChannel::suspend() {
+    return channel.pid() > 0 && kill(channel.pid(), SIGUSR2) == 0;
+}
