@@ -1,5 +1,7 @@
+#include "../shell/HistorySearch.h"
 #include "../shell/HotkeyConfig.h"
 #include "../shell/LineEditing.h"
+#include "../shell/SharedHistory.h"
 
 #include "TerminalWindow.h"
 #include "X11Clipboard.h"
@@ -39,6 +41,7 @@ TerminalWindow::TerminalWindow()
             if (fdflags >= 0) fcntl(fd, F_SETFD, fdflags | FD_CLOEXEC);
         }
     }
+    commandHistory = SharedHistory::load();
     createTab();
 }
 
@@ -231,7 +234,7 @@ void TerminalWindow::redraw() {
             } else {
                 line = (tab.multilinePending.empty() ?
                        "user@terminator:" + tab.shell.getCwd().filename().string() + "> " :
-                       "> ") + LineEditing::display(tab.input, tab.cursor);
+                       "> ") + (tab.searchingHistory ? std::string("Enter search term: ") : std::string()) + LineEditing::display(tab.input, tab.cursor);
             }
         }
 
@@ -316,7 +319,7 @@ void TerminalWindow::redrawInputLine() { // optimization
     std::string prompt =
         (tab.multilinePending.empty() ?
         "user@terminator:" + tab.shell.getCwd().filename().string() + "> " :
-        "> ") + LineEditing::display(tab.input, tab.cursor);
+        "> ") + (tab.searchingHistory ? std::string("Enter search term: ") : std::string()) + LineEditing::display(tab.input, tab.cursor);
 
     XDrawString(
         display,
@@ -450,7 +453,8 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
         if (command.find_first_not_of(" \t\r") == std::string::npos)
             continue;
 
-        commandHistory.push_back(item.text);
+        SharedHistory::append(item.text);
+        commandHistory = SharedHistory::load();
         tab.lines.push_back("user@terminator:" +
             tab.shell.getCwd().filename().string() + "> " + command);
 
@@ -465,8 +469,9 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
                 tab.lines.push_back(error);
         }
         else if (name == "history") {
-            for (size_t i = 0; i < commandHistory.size(); ++i)
-                tab.lines.push_back(std::to_string(i + 1) + "  " + commandHistory[i]);
+            auto recent = SharedHistory::recent();
+            for (size_t i = 0; i < recent.size(); ++i)
+                tab.lines.push_back(std::to_string(i + 1) + "  " + recent[i]);
             tab.shell.setLastStatus(0);
         }
         else if (name == "jobs") {
@@ -670,11 +675,50 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
     }
 
     Tab& tab = currentTab();
+    if ((event.state & ControlMask) && (key == XK_r || key == XK_R) &&
+        !tab.searchingHistory && !tab.executor.isRunning() &&
+        !tab.hasPendingSubmission()) {
+        tab.searchingHistory = true;
+        tab.historySavedInput = tab.input;
+        tab.historySavedCursor = tab.cursor;
+        tab.input.clear(); tab.cursor = 0;
+        tab.scrollOffset = 0;
+        redraw();
+        return;
+    }
+    if (tab.searchingHistory) {
+        if (key == XK_Return || key == XK_KP_Enter) {
+            const std::string term = tab.input;
+            tab.searchingHistory = false;
+            tab.input = tab.historySavedInput;
+            tab.cursor = tab.historySavedCursor;
+            tab.lines.push_back("Enter search term: " + term);
+            auto results = HistorySearch::find(term);
+            if (results.empty()) tab.lines.push_back("No match for search term in history");
+            else for (const auto& command : results) tab.lines.push_back(command);
+            redraw();
+        } else if (key == XK_Escape) {
+            tab.searchingHistory = false;
+            tab.input = tab.historySavedInput;
+            tab.cursor = tab.historySavedCursor;
+            redraw();
+        } else if (LineEditing::apply(tab.input, tab.cursor, key,
+                                      (event.state & ControlMask) != 0)) {
+            redrawInputLine();
+        } else if (!(event.state & ControlMask) && count > 0) {
+            for (int i = 0; i < count; ++i)
+                if (buffer[i] >= 32 && buffer[i] <= 126)
+                    LineEditing::insert(tab.input, tab.cursor, buffer[i]);
+            redrawInputLine();
+        }
+        return;
+    }
     if (tab.executor.isRunning() || !tab.commandQueue.empty() ||
         tab.hasPendingSubmission()) return;
     // Navigate the shared command history with Up/Down arrows.
     // Preserve what the user was typing before entering history browsing.
     if ((key == XK_Up || key == XK_Down) && tab.multilinePending.empty()) {
+        if (key == XK_Up) commandHistory = SharedHistory::load();
         if (key == XK_Up && !commandHistory.empty()) {
             if (!tab.browsingHistory) {
                 tab.historyDraft = tab.input;
@@ -729,8 +773,10 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
         std::string name;
         input >> name;
         if (name == "exit") {
-            if (rawCommand.find_first_not_of(" \t") != std::string::npos)
-                commandHistory.push_back(rawCommand);
+            if (rawCommand.find_first_not_of(" \t") != std::string::npos) {
+                SharedHistory::append(rawCommand);
+                commandHistory = SharedHistory::load();
+            }
             closeTab();
             redraw();
             return;

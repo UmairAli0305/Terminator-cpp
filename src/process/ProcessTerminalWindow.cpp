@@ -1,5 +1,7 @@
+#include "../shell/HistorySearch.h"
 #include "../shell/HotkeyConfig.h"
 #include "../shell/LineEditing.h"
+#include "../shell/SharedHistory.h"
 #include "../gui/X11Clipboard.h"
 #include "../gui/MouseSelection.h"
 #include "AsyncProcessChannel.h"
@@ -25,6 +27,9 @@ struct ProcessTab {
     std::string historyDraft;
     size_t historyPosition = 0;
     bool browsingHistory = false;
+    bool searchingHistory = false;
+    std::string historySavedInput;
+    size_t historySavedCursor = 0;
     std::string multilinePending;
     bool busy = false;
 };
@@ -78,6 +83,7 @@ int runProcessWindow() {
     auto newTab = [&]() -> bool {
         if (available.empty()) return false;
         ProcessTab tab;
+        tab.history = SharedHistory::load();
         tab.child = std::move(available.back());
         available.pop_back();
         tabs.push_back(std::move(tab));
@@ -113,7 +119,8 @@ int runProcessWindow() {
                         static_cast<int>(tab.lines[i].size()));
         }
         std::string prompt = tab.busy ? "[command running...]" :
-                                           (tab.multilinePending.empty() ? "user@terminator> " : "> ") + LineEditing::display(tab.input, tab.cursor);
+                                           (tab.multilinePending.empty() ? "user@terminator> " : "> ") + (tab.searchingHistory ? std::string("Enter search term: ") : std::string()) +
+            LineEditing::display(tab.input, tab.cursor);
         XDrawString(display, window, gc, 20, y, prompt.c_str(),
                     static_cast<int>(prompt.size()));
         if (selectionTab == active) selection.draw(display, window, gc);
@@ -129,6 +136,7 @@ int runProcessWindow() {
         XClearArea(display, window, 20, y - 17, 850, 22, False);
         std::string prompt = tab.busy ? "[command running...]" :
             (tab.multilinePending.empty() ? "user@terminator> " : "> ") +
+            (tab.searchingHistory ? std::string("Enter search term: ") : std::string()) +
             LineEditing::display(tab.input, tab.cursor);
         XDrawString(display, window, gc, 20, y, prompt.c_str(),
                     static_cast<int>(prompt.size()));
@@ -176,6 +184,43 @@ int runProcessWindow() {
             char buffer[32];
             int count = XLookupString(&event.xkey, buffer, sizeof(buffer), &key, nullptr);
             HotkeyConfig::translate(key, event.xkey.state);
+            ProcessTab& searchTab = tabs[active];
+            if ((event.xkey.state & ControlMask) && (key == XK_r || key == XK_R) &&
+                !searchTab.busy && !searchTab.searchingHistory) {
+                searchTab.searchingHistory = true;
+                searchTab.historySavedInput = searchTab.input;
+                searchTab.historySavedCursor = searchTab.cursor;
+                searchTab.input.clear(); searchTab.cursor = 0;
+                dirty = true;
+                continue;
+            }
+            if (searchTab.searchingHistory) {
+                if (key == XK_Return || key == XK_KP_Enter) {
+                    std::string term = searchTab.input;
+                    searchTab.searchingHistory = false;
+                    searchTab.input = searchTab.historySavedInput;
+                    searchTab.cursor = searchTab.historySavedCursor;
+                    searchTab.lines.push_back("Enter search term: " + term);
+                    auto matches = HistorySearch::find(term);
+                    if (matches.empty()) searchTab.lines.push_back("No match for search term in history");
+                    else for (const auto& command : matches) searchTab.lines.push_back(command);
+                    dirty = true;
+                } else if (key == XK_Escape) {
+                    searchTab.searchingHistory = false;
+                    searchTab.input = searchTab.historySavedInput;
+                    searchTab.cursor = searchTab.historySavedCursor;
+                    dirty = true;
+                } else if (LineEditing::apply(searchTab.input, searchTab.cursor, key,
+                                              (event.xkey.state & ControlMask) != 0)) {
+                    inputDirty = true;
+                } else if (!(event.xkey.state & ControlMask) && count > 0) {
+                    for (int i = 0; i < count; ++i)
+                        if (buffer[i] >= 32 && buffer[i] <= 126)
+                            LineEditing::insert(searchTab.input, searchTab.cursor, buffer[i]);
+                    inputDirty = true;
+                }
+                continue;
+            }
             if (key == XK_Escape) {
                 bool anyBusy = false;
                 for (const auto& tab : tabs) anyBusy |= tab.busy;
@@ -256,6 +301,7 @@ int runProcessWindow() {
             if (tab.busy) continue;
             bool editedInput = true;
             if ((key == XK_Up || key == XK_Down) && tab.multilinePending.empty()) {
+                if (key == XK_Up) tab.history = SharedHistory::load();
                 if (key == XK_Up && !tab.history.empty()) {
                     if (!tab.browsingHistory) {
                         tab.historyDraft = tab.input;
@@ -300,9 +346,14 @@ int runProcessWindow() {
                         if (active >= tabs.size()) active = tabs.size() - 1;
                     }
                 } else if (!command.empty()) {
-                    tab.history.push_back(command);
+                    SharedHistory::append(command);
+                    tab.history = SharedHistory::load();
                     tab.lines.push_back("user@terminator> " + command);
-                    if (!tab.child->submit(command))
+                    if (command == "history") {
+                        auto recent = SharedHistory::recent();
+                        for (size_t i = 0; i < recent.size(); ++i)
+                            tab.lines.push_back(std::to_string(i + 1) + "  " + recent[i]);
+                    } else if (!tab.child->submit(command))
                         tab.lines.push_back("Failed to send command.");
                     else tab.busy = true;
                     tab.input.clear();

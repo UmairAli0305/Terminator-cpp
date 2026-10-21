@@ -114,6 +114,9 @@ public:
 
     std::string input;
     size_t cursor = 0;
+    bool searchingHistory = false;
+    std::string historySavedInput;
+    size_t historySavedCursor = 0;
     std::string historyDraft;
     size_t historyPosition = 0;
     bool browsingHistory = false;
