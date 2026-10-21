@@ -552,16 +552,17 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
                 tab.shell.setLastStatus(1);
             }
         }
-        else if (name == "source") {
+        else if (name == "source" || name == "bash" || name.rfind("./", 0) == 0) {
             std::string filename, extra;
-            stream >> filename;
+            if (name.rfind("./", 0) == 0) filename = name;
+            else stream >> filename;
             if (filename.empty() || (stream >> extra)) {
-                tab.lines.push_back("source: usage: source filename");
+                tab.lines.push_back("script: usage: source filename | bash filename | ./filename");
                 tab.shell.setLastStatus(1);
                 continue;
             }
             if (item.sourceDepth >= 8) {
-                tab.lines.push_back("source: maximum nesting depth (8) exceeded");
+                tab.lines.push_back("script: maximum nesting depth (8) exceeded");
                 tab.shell.setLastStatus(1);
                 continue;
             }
@@ -570,7 +571,7 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
                 filePath = tab.shell.getCwd() / filePath;
             std::ifstream file(filePath);
             if (!file) {
-                tab.lines.push_back("source: cannot open " + filename);
+                tab.lines.push_back("script: cannot open " + filename);
                 tab.shell.setLastStatus(1);
                 continue;
             }
@@ -583,8 +584,27 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
                 scriptLines.push_back(line);
             }
             if (file.bad()) {
-                tab.lines.push_back("source: error reading " + filename);
+                tab.lines.push_back("script: error reading " + filename);
                 tab.shell.setLastStatus(1);
+                continue;
+            }
+            // Stage 11A supports sequential simple commands. Reject unsupported
+            // script grammar before executing anything (Stage 11C adds if/fi).
+            bool unsupported = false;
+            for (const auto& scriptLine : scriptLines) {
+                std::istringstream tokens(scriptLine);
+                std::string first;
+                tokens >> first;
+                if (first == "if" || first == "elif" || first == "else" ||
+                    first == "fi" || first == "then" || first == "for" ||
+                    first == "while" || first == "function") {
+                    unsupported = true;
+                    break;
+                }
+            }
+            if (unsupported) {
+                tab.lines.push_back("script: control structures are not yet supported (Stage 11C)");
+                tab.shell.setLastStatus(2);
                 continue;
             }
             // Insert script commands ahead of later queued commands.
