@@ -1,4 +1,7 @@
+#include "../shell/HotkeyConfig.h"
 #include "../shell/LineEditing.h"
+#include "../gui/X11Clipboard.h"
+#include "../gui/MouseSelection.h"
 #include "AsyncProcessChannel.h"
 #include "../shell/MultilineInput.h"
 #include <X11/Xlib.h>
@@ -65,9 +68,10 @@ int runProcessWindow() {
                                         BlackPixel(display, screen),
                                         WhitePixel(display, screen));
     if (!window) { XCloseDisplay(display); return 1; }
-    XSelectInput(display, window, ExposureMask | KeyPressMask);
+    XSelectInput(display, window, ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
     GC gc = XCreateGC(display, window, 0, nullptr);
     if (!gc) { XDestroyWindow(display, window); XCloseDisplay(display); return 1; }
+    X11Clipboard clipboard(display, window);
     XMapWindow(display, window);
 
     std::vector<ProcessTab> tabs;
@@ -82,6 +86,11 @@ int runProcessWindow() {
     newTab();
     size_t active = 0;
     bool running = true, dirty = true;
+    bool inputDirty = false;
+    MouseSelection selection;
+    XFontStruct* selectionFont = XQueryFont(display, XGContextFromGC(gc));
+    selection.setFont(selectionFont);
+    size_t selectionTab = 0;
     auto draw = [&] {
         XClearWindow(display, window);
         int x = 20;
@@ -107,25 +116,100 @@ int runProcessWindow() {
                                            (tab.multilinePending.empty() ? "user@terminator> " : "> ") + LineEditing::display(tab.input, tab.cursor);
         XDrawString(display, window, gc, 20, y, prompt.c_str(),
                     static_cast<int>(prompt.size()));
+        if (selectionTab == active) selection.draw(display, window, gc);
         XFlush(display);
         dirty = false;
     };
 
+    auto drawInput = [&] {
+        const ProcessTab& tab = tabs[active];
+        const int visible = 20;
+        int shown = std::min(static_cast<int>(tab.lines.size()), visible - 1);
+        int y = 65 + shown * 22;
+        XClearArea(display, window, 20, y - 17, 850, 22, False);
+        std::string prompt = tab.busy ? "[command running...]" :
+            (tab.multilinePending.empty() ? "user@terminator> " : "> ") +
+            LineEditing::display(tab.input, tab.cursor);
+        XDrawString(display, window, gc, 20, y, prompt.c_str(),
+                    static_cast<int>(prompt.size()));
+        XFlush(display);
+    };
     while (running) {
         while (XPending(display)) {
             XEvent event;
             XNextEvent(display, &event);
+            std::string pasted;
+            if (clipboard.handle(event, pasted)) {
+                if (!pasted.empty() && !tabs[active].busy) {
+                    for (unsigned char c : pasted)
+                        if (c >= 32 && c != 127)
+                            LineEditing::insert(tabs[active].input, tabs[active].cursor, c);
+                    drawInput();
+                }
+                continue;
+            }
             if (event.type == Expose) { dirty = true; continue; }
+            if (event.type == ButtonPress && event.xbutton.button == Button1 && event.xbutton.y >= 48) {
+                const ProcessTab& tab = tabs[active];
+                std::vector<std::string> visible;
+                int start = std::max(0, static_cast<int>(tab.lines.size()) - 19);
+                for (int i=start; i<static_cast<int>(tab.lines.size()); ++i)
+                    visible.push_back(tab.lines[i]);
+                visible.push_back(tab.busy ? "[command running...]" :
+                    (tab.multilinePending.empty() ? "user@terminator> " : "> ") +
+                    LineEditing::display(tab.input, tab.cursor));
+                selectionTab = active;
+                selection.begin(event.xbutton.x, event.xbutton.y, std::move(visible));
+                dirty = true;
+                continue;
+            }
+            if (event.type == MotionNotify && (event.xmotion.state & Button1Mask)) {
+                if (selectionTab == active) { selection.move(event.xmotion.x, event.xmotion.y); dirty = true; }
+                continue;
+            }
+            if (event.type == ButtonRelease && event.xbutton.button == Button1) {
+                if (selectionTab == active) { selection.finish(event.xbutton.x, event.xbutton.y); dirty = true; }
+                continue;
+            }
             if (event.type != KeyPress) continue;
             KeySym key;
             char buffer[32];
             int count = XLookupString(&event.xkey, buffer, sizeof(buffer), &key, nullptr);
+            HotkeyConfig::translate(key, event.xkey.state);
             if (key == XK_Escape) {
                 bool anyBusy = false;
                 for (const auto& tab : tabs) anyBusy |= tab.busy;
                 if (!anyBusy) running = false;
                 else tabs[active].lines.push_back("Wait for running commands before exit.");
                 dirty = true;
+                continue;
+            }
+            if ((event.xkey.state & ControlMask) && (event.xkey.state & ShiftMask)) {
+                if (key == XK_c || key == XK_C) {
+                    clipboard.copy(selectionTab == active && !selection.selectedText().empty()
+                                   ? selection.selectedText() : tabs[active].input);
+                    continue;
+                }
+                if (key == XK_v || key == XK_V) {
+                    if (!tabs[active].busy) clipboard.requestPaste();
+                    continue;
+                }
+            }
+            if ((event.xkey.state & ControlMask) && (key == XK_l || key == XK_L)) {
+                tabs[active].lines.clear();
+                dirty = true;
+                continue;
+            }
+            if ((event.xkey.state & ControlMask) && (key == XK_d || key == XK_D)) {
+                if (!tabs[active].busy && tabs[active].input.empty() &&
+                    tabs[active].multilinePending.empty()) {
+                    if (tabs.size() > 1) {
+                        available.push_back(std::move(tabs[active].child));
+                        tabs.erase(tabs.begin() + static_cast<long>(active));
+                        if (active >= tabs.size()) active = tabs.size() - 1;
+                    } else running = false;
+                    dirty = true;
+                }
                 continue;
             }
             if (event.xkey.state & ControlMask) {
@@ -148,7 +232,8 @@ int runProcessWindow() {
                     }
                 } else if (LineEditing::apply(tabs[active].input, tabs[active].cursor,
                                               key, true)) {
-                    // Input editing handled by the shared line editor.
+                    // Only the prompt changes; avoid clearing command output.
+                    inputDirty = true;
                 } else if (key == XK_c || key == XK_C) {
                     if (tabs[active].busy) {
                         if (!tabs[active].child->interrupt())
@@ -160,11 +245,12 @@ int runProcessWindow() {
                 } else if (key == XK_z || key == XK_Z) {
                     tabs[active].lines.push_back("P6: Ctrl+Z pending job-control IPC.");
                 }
-                dirty = true;
+                if (!inputDirty) dirty = true;
                 continue;
             }
             ProcessTab& tab = tabs[active];
             if (tab.busy) continue;
+            bool editedInput = true;
             if ((key == XK_Up || key == XK_Down) && tab.multilinePending.empty()) {
                 if (key == XK_Up && !tab.history.empty()) {
                     if (!tab.browsingHistory) {
@@ -189,6 +275,7 @@ int runProcessWindow() {
             } else if (LineEditing::apply(tab.input, tab.cursor, key, false)) {
                 // Cursor motion, Backspace and Delete.
             } else if (key == XK_Return || key == XK_KP_Enter) {
+                editedInput = false;
                 std::string command = tab.multilinePending;
                 tab.browsingHistory = false;
                 tab.historyDraft.clear();
@@ -221,7 +308,8 @@ int runProcessWindow() {
                     if (buffer[i] >= 32 && buffer[i] <= 126)
                         LineEditing::insert(tab.input, tab.cursor, buffer[i]);
             }
-            dirty = true;
+            if (editedInput) inputDirty = true;
+            else dirty = true;
         }
         for (auto& tab : tabs) {
             for (auto& response : tab.child->takeReplies()) {
@@ -242,7 +330,8 @@ int runProcessWindow() {
                 dirty = true;
             }
         }
-        if (dirty) draw();
+        if (dirty) { draw(); inputDirty = false; }
+        else if (inputDirty) { drawInput(); inputDirty = false; }
         pollfd xfd{};
         xfd.fd = ConnectionNumber(display);
         xfd.events = POLLIN;

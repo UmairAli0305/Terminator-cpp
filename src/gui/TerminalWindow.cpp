@@ -1,6 +1,8 @@
+#include "../shell/HotkeyConfig.h"
 #include "../shell/LineEditing.h"
 
 #include "TerminalWindow.h"
+#include "X11Clipboard.h"
 #include "../shell/MultilineInput.h"
 
 #include <X11/Xutil.h>
@@ -156,7 +158,7 @@ bool TerminalWindow::initialize() {
     XSelectInput(
     display,
     window,
-    ExposureMask | KeyPressMask | ButtonPressMask );
+    ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask );
 
     gc = XCreateGC(display, window, 0, nullptr);
 
@@ -165,6 +167,9 @@ bool TerminalWindow::initialize() {
         return false;
     }
 
+    clipboard = std::make_unique<X11Clipboard>(display, window);
+    selectionFont = XQueryFont(display, XGContextFromGC(gc));
+    selection.setFont(selectionFont);
     XMapWindow(display, window);
     XFlush(display);
 
@@ -279,6 +284,7 @@ void TerminalWindow::redraw() {
         );
     }
 
+    if (selectionTab == activeTab) selection.draw(display, window, gc);
     XFlush(display);
 }
 void TerminalWindow::redrawInputLine() { // optimization
@@ -608,7 +614,31 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
     KeySym key;
     char buffer[32];
     int count = XLookupString(&event, buffer, sizeof(buffer), &key, nullptr);
+    HotkeyConfig::translate(key, event.state);
 
+    if ((event.state & ControlMask) && (event.state & ShiftMask)) {
+        if (key == XK_c || key == XK_C) {
+            clipboard->copy(selectionTab == activeTab && !selection.selectedText().empty()
+                            ? selection.selectedText() : currentTab().input);
+            return;
+        }
+        if (key == XK_v || key == XK_V) {
+            if (!currentTab().executor.isRunning()) clipboard->requestPaste();
+            return;
+        }
+    }
+    if ((event.state & ControlMask) && (key == XK_l || key == XK_L)) {
+        currentTab().lines.clear();
+        currentTab().pendingOutput.clear();
+        currentTab().scrollOffset = 0;
+        redraw(); return;
+    }
+    if ((event.state & ControlMask) && (key == XK_d || key == XK_D)) {
+        if (currentTab().input.empty() && currentTab().multilinePending.empty()) {
+            closeTab(); redraw();
+        }
+        return;
+    }
     if (event.state & ControlMask) {
         if (key == XK_c || key == XK_C) {
             if (currentTab().executor.signalForeground(SIGINT)) {
@@ -734,13 +764,53 @@ void TerminalWindow::run() {
         while (XPending(display) > 0) {
             XEvent event;
             XNextEvent(display, &event);
+            std::string pasted;
+            if (clipboard && clipboard->handle(event, pasted)) {
+                if (!pasted.empty() && !currentTab().executor.isRunning()) {
+                    Tab& tab = currentTab();
+                    for (unsigned char c : pasted)
+                        if (c >= 32 && c != 127) LineEditing::insert(tab.input, tab.cursor, c);
+                    if (tab.scrollOffset == 0) redrawInputLine(); else redraw();
+                }
+                continue;
+            }
+
 
             if (event.type == Expose &&
                 event.xexpose.count == 0) {
                 redraw();
             }
 
+            else if (event.type == MotionNotify) {
+                if (event.xmotion.state & Button1Mask && selectionTab == activeTab) {
+                    selection.move(event.xmotion.x, event.xmotion.y);
+                    redraw();
+                }
+            }
+            else if (event.type == ButtonRelease && event.xbutton.button == Button1) {
+                if (selectionTab == activeTab) {
+                    selection.finish(event.xbutton.x, event.xbutton.y);
+                    redraw();
+                }
+            }
             else if (event.type == ButtonPress) {
+                if (event.xbutton.button == Button1 && event.xbutton.y >= 48) {
+                    Tab& tab = currentTab();
+                    std::vector<std::string> visible;
+                    const int total = static_cast<int>(tab.lines.size()) + 1;
+                    const int start = std::max(0, total - 20 - tab.scrollOffset);
+                    const int end = std::min(total, start + 20);
+                    for (int i=start; i<end; ++i) {
+                        if (i < static_cast<int>(tab.lines.size())) visible.push_back(tab.lines[i]);
+                        else visible.push_back(tab.executor.isRunning() ? "[command running...]" :
+                            (tab.multilinePending.empty() ? "user@terminator:" +
+                            tab.shell.getCwd().filename().string() + "> " : "> ") +
+                            LineEditing::display(tab.input, tab.cursor));
+                    }
+                    selectionTab = activeTab;
+                    selection.begin(event.xbutton.x, event.xbutton.y, std::move(visible));
+                    redraw();
+                }
                 if (event.xbutton.button == Button4) {
                     scroll(3);   // Scroll up three lines
                 }

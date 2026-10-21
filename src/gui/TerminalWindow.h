@@ -3,10 +3,12 @@
 #define TERMINAL_WINDOW_H
 
 #include <X11/Xlib.h>
+#include "MouseSelection.h"
 
 #include "../tabs/Tab.h"
 
 #include <memory>
+class X11Clipboard;
 #include <mutex>
 #include <string>
 #include <vector>
@@ -16,6 +18,10 @@ private:
     Display* display;
     Window window;
     GC gc;
+    std::unique_ptr<X11Clipboard> clipboard;
+    MouseSelection selection;
+    XFontStruct* selectionFont = nullptr;
+    int selectionTab = -1;
     // Protects shell/executor/command queues and GUI-visible tab state.
     std::mutex stateMutex;
     int wakeReadFd = -1;
