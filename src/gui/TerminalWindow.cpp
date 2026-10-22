@@ -450,7 +450,9 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
         Tab::QueuedCommand item = tab.commandQueue.front();
         tab.commandQueue.pop_front();
 
-        const std::string command = tab.shell.expandExitStatus(item.text);
+        auto& variables = item.scriptVariables ? *item.scriptVariables : tab.shellVariables;
+        const std::string command = ScriptVariables::expand(
+            item.text, variables, item.arguments, tab.shell.getLastStatus());
         if (command.find_first_not_of(" \t\r") == std::string::npos)
             continue;
 
@@ -463,7 +465,13 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
         std::string name;
         stream >> name;
 
-        if (name == "cd") {
+        std::string assignedName, assignedValue;
+        if (ScriptVariables::assignment(command, assignedName, assignedValue)) {
+            // Only a standalone assignment is recognized at this stage.
+            variables[assignedName] = assignedValue;
+            tab.shell.setLastStatus(0);
+        }
+        else if (name == "cd") {
             std::string destination, error;
             stream >> destination;
             if (!tab.shell.changeDirectory(destination, error))
@@ -553,10 +561,10 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
             }
         }
         else if (name == "source" || name == "bash" || name.rfind("./", 0) == 0) {
-            std::string filename, extra;
+            std::string filename;
             if (name.rfind("./", 0) == 0) filename = name;
             else stream >> filename;
-            if (filename.empty() || (stream >> extra)) {
+            if (filename.empty()) {
                 tab.lines.push_back("script: usage: source filename | bash filename | ./filename");
                 tab.shell.setLastStatus(1);
                 continue;
@@ -607,16 +615,45 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
                 tab.shell.setLastStatus(2);
                 continue;
             }
-            // Insert script commands ahead of later queued commands.
+            // Source shares variables with its caller. Executed scripts use a
+            // separate environment, initialized from their caller's variables.
+            std::vector<std::string> arguments;
+            std::string argument;
+            while (stream >> argument) arguments.push_back(argument);
+            auto scriptVars = name == "source" ? item.scriptVariables
+                : std::make_shared<std::map<std::string, std::string>>(variables);
+            const size_t scriptId = tab.nextScriptId++;
             for (auto it = scriptLines.rbegin(); it != scriptLines.rend(); ++it)
-                tab.commandQueue.push_front({*it, item.sourceDepth + 1});
+                tab.commandQueue.push_front({*it, item.sourceDepth + 1,
+                                             arguments, scriptVars, scriptId});
             if (scriptLines.empty()) tab.shell.setLastStatus(0);
         }
         else if (name == "exit") {
             // In a sourced file, exit stops the script. At the interactive
             // prompt it is handled separately in handleKeyPress().
-            tab.commandQueue.clear();
-            tab.shell.setLastStatus(0);
+            int status = 0;
+            std::string argument;
+            if (stream >> argument) {
+                try {
+                    size_t consumed = 0;
+                    status = std::stoi(argument, &consumed);
+                    if (consumed != argument.size()) throw std::invalid_argument("exit");
+                    status &= 255;
+                } catch (...) {
+                    tab.lines.push_back("exit: numeric argument required");
+                    status = 2;
+                }
+            }
+            if (item.scriptId) {
+                auto& queue = tab.commandQueue;
+                queue.erase(std::remove_if(queue.begin(), queue.end(),
+                    [&](const Tab::QueuedCommand& queued) {
+                        return queued.scriptId == item.scriptId;
+                    }), queue.end());
+            } else {
+                tab.commandQueue.clear();
+            }
+            tab.shell.setLastStatus(status);
         }
         else {
             std::string external = command;
@@ -951,7 +988,7 @@ void TerminalWindow::run() {
         // No worker directly touches the GUI, shell state or command queue.
         for (auto& tab : tabs) {
             for (std::string& command : tab->takeSubmittedCommands())
-                tab->commandQueue.push_back({std::move(command), 0});
+               tab->commandQueue.push_back({std::move(command), 0, {}, {}});
             if (!tab->commandQueue.empty() && !tab->executor.isRunning())
                 scheduleCommandProcessing(*tab);
         }

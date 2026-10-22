@@ -3,6 +3,7 @@
 #define TAB_H
 #include "../shell/ShellSession.h"
 #include "../shell/CompletionChoice.h"
+#include "../shell/ScriptVariables.h"
 #include "../shell/CommandExecutor.h"
 
 #include <atomic>
@@ -10,6 +11,8 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <map>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <filesystem>
@@ -129,10 +132,17 @@ public:
     int scrollOffset = 0;
     ShellSession shell;
 
+    std::map<std::string, std::string> shellVariables;
     struct QueuedCommand {
         std::string text;
         int sourceDepth = 0;
+        std::vector<std::string> arguments;
+        // Each executed script has its own variable map; sourced scripts use
+        // the tab's persistent shellVariables instead.
+        std::shared_ptr<std::map<std::string, std::string>> scriptVariables;
+        size_t scriptId = 0;
     };
+    size_t nextScriptId = 1;
     std::deque<QueuedCommand> commandQueue;
     
 
