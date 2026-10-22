@@ -450,6 +450,17 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
         Tab::QueuedCommand item = tab.commandQueue.front();
         tab.commandQueue.pop_front();
 
+        if (item.conditionState) {
+            const std::string control = ScriptConditionals::keyword(item.text);
+            if (!control.empty()) {
+                auto& vars = item.scriptVariables ? *item.scriptVariables : tab.shellVariables;
+                const std::string expanded = ScriptVariables::expand(
+                    item.text, vars, item.arguments, tab.shell.getLastStatus());
+                ScriptConditionals::advance(*item.conditionState, expanded, tab.shell.getCwd());
+                continue;
+            }
+            if (!ScriptConditionals::active(*item.conditionState)) continue;
+        }
         auto& variables = item.scriptVariables ? *item.scriptVariables : tab.shellVariables;
         const std::string command = ScriptVariables::expand(
             item.text, variables, item.arguments, tab.shell.getLastStatus());
@@ -596,22 +607,10 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
                 tab.shell.setLastStatus(1);
                 continue;
             }
-            // Stage 11A supports sequential simple commands. Reject unsupported
-            // script grammar before executing anything (Stage 11C adds if/fi).
-            bool unsupported = false;
-            for (const auto& scriptLine : scriptLines) {
-                std::istringstream tokens(scriptLine);
-                std::string first;
-                tokens >> first;
-                if (first == "if" || first == "elif" || first == "else" ||
-                    first == "fi" || first == "then" || first == "for" ||
-                    first == "while" || first == "function") {
-                    unsupported = true;
-                    break;
-                }
-            }
-            if (unsupported) {
-                tab.lines.push_back("script: control structures are not yet supported (Stage 11C)");
+            // Validate the complete conditional structure before running anything.
+            std::string syntaxError;
+            if (!ScriptConditionals::validate(scriptLines, syntaxError)) {
+                tab.lines.push_back("script: syntax error: " + syntaxError);
                 tab.shell.setLastStatus(2);
                 continue;
             }
@@ -623,9 +622,10 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
             auto scriptVars = name == "source" ? item.scriptVariables
                 : std::make_shared<std::map<std::string, std::string>>(variables);
             const size_t scriptId = tab.nextScriptId++;
+            auto conditionState = std::make_shared<ScriptConditionals::State>();
             for (auto it = scriptLines.rbegin(); it != scriptLines.rend(); ++it)
                 tab.commandQueue.push_front({*it, item.sourceDepth + 1,
-                                             arguments, scriptVars, scriptId});
+                                             arguments, scriptVars, scriptId, conditionState});
             if (scriptLines.empty()) tab.shell.setLastStatus(0);
         }
         else if (name == "exit") {
@@ -988,7 +988,7 @@ void TerminalWindow::run() {
         // No worker directly touches the GUI, shell state or command queue.
         for (auto& tab : tabs) {
             for (std::string& command : tab->takeSubmittedCommands())
-               tab->commandQueue.push_back({std::move(command), 0, {}, {}});
+               tab->commandQueue.push_back({std::move(command), 0, {}, {}, 0, {}});
             if (!tab->commandQueue.empty() && !tab->executor.isRunning())
                 scheduleCommandProcessing(*tab);
         }

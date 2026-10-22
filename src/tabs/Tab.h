@@ -4,6 +4,7 @@
 #include "../shell/ShellSession.h"
 #include "../shell/CompletionChoice.h"
 #include "../shell/ScriptVariables.h"
+#include "../shell/ScriptConditionals.h"
 #include "../shell/CommandExecutor.h"
 
 #include <atomic>
@@ -141,6 +142,7 @@ public:
         // the tab's persistent shellVariables instead.
         std::shared_ptr<std::map<std::string, std::string>> scriptVariables;
         size_t scriptId = 0;
+        std::shared_ptr<ScriptConditionals::State> conditionState;
     };
     size_t nextScriptId = 1;
     std::deque<QueuedCommand> commandQueue;
