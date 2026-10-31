@@ -1,6 +1,12 @@
 #include "ProcessChannel.h"
 #include "../shell/ShellSession.h"
 #include "../shell/CommandExecutor.h"
+#include "../shell/ScriptVariables.h"
+#include "../shell/ScriptConditionals.h"
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <memory>
 #include <poll.h>
 #include <sstream>
 #include <cerrno>
@@ -17,6 +23,151 @@ volatile sig_atomic_t interruptRequested = 0;
 volatile sig_atomic_t suspendRequested = 0;
 extern "C" void processInterrupt(int) { interruptRequested = 1; }
 extern "C" void processSuspend(int) { suspendRequested = 1; }
+
+// Process-mode scripts are interpreted by Terminator's child, not by bash/sh.
+// The child owns shell variables and executes external commands via CommandExecutor.
+struct ScriptRuntime {
+    ShellSession& shell;
+    CommandExecutor& executor;
+    std::map<std::string, std::string>& variables;
+    int status = 0;
+    bool stopped = false;
+    std::string output;
+};
+
+std::vector<std::string> scriptTokens(const std::string& line) {
+    return ScriptConditionals::words(line);
+}
+
+bool scriptInvocation(const std::string& line, std::string& filename,
+                      std::vector<std::string>& args, bool& sourced) {
+    auto tokens = scriptTokens(line);
+    if (tokens.empty()) return false;
+    const std::string& op = tokens.front();
+    if (op != "source" && op != "bash" && op.rfind("./", 0) != 0) return false;
+    sourced = op == "source";
+    size_t offset = op.rfind("./", 0) == 0 ? 0 : 1;
+    if (tokens.size() <= offset) { filename.clear(); return true; }
+    filename = tokens[offset];
+    args.assign(tokens.begin() + static_cast<long>(offset + 1), tokens.end());
+    return true;
+}
+
+int runScriptText(const std::string& raw, ScriptRuntime& runtime,
+                  std::map<std::string, std::string>& vars,
+                  const std::vector<std::string>& args, int depth);
+
+int runScriptFile(const std::string& filename, ScriptRuntime& runtime,
+                  std::map<std::string, std::string>& vars,
+                  const std::vector<std::string>& args, int depth) {
+    if (depth > 8) { runtime.output += "script: maximum nesting depth (8) exceeded\n"; return 1; }
+    if (filename.empty()) { runtime.output += "script: missing filename\n"; return 2; }
+    std::filesystem::path path(filename);
+    if (path.is_relative()) path = runtime.shell.getCwd() / path;
+    std::ifstream file(path);
+    if (!file) { runtime.output += "script: cannot open " + filename + "\n"; return 1; }
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(line);
+    }
+    if (file.bad()) { runtime.output += "script: error reading " + filename + "\n"; return 1; }
+    std::string error;
+    if (!ScriptConditionals::validate(lines, error)) {
+        runtime.output += "script: syntax error: " + error + "\n";
+        return 2;
+    }
+    ScriptConditionals::State state;
+    int status = 0;
+    for (const auto& raw : lines) {
+        const std::string trimmed = ScriptConditionals::trim(raw);
+        if (trimmed.empty() || trimmed[0] == '#') continue;
+        const std::string keyword = ScriptConditionals::keyword(trimmed);
+        if (!keyword.empty()) {
+            const auto expanded = ScriptVariables::expand(trimmed, vars, args, status);
+            ScriptConditionals::advance(state, expanded, runtime.shell.getCwd());
+            continue;
+        }
+        if (!ScriptConditionals::active(state)) continue;
+        status = runScriptText(trimmed, runtime, vars, args, depth);
+        if (runtime.stopped) { runtime.stopped = false; break; }
+    }
+    return status;
+}
+
+int runScriptText(const std::string& raw, ScriptRuntime& runtime,
+                  std::map<std::string, std::string>& vars,
+                  const std::vector<std::string>& args, int depth) {
+    std::string command = ScriptVariables::expand(raw, vars, args, runtime.status);
+    std::string name, value;
+    if (ScriptVariables::assignment(command, name, value)) {
+        vars[name] = value; runtime.status = 0; return 0;
+    }
+    auto tokens = scriptTokens(command);
+    if (tokens.empty()) return 0;
+    if (tokens[0] == "exit") {
+        int code = runtime.status;
+        if (tokens.size() > 1) {
+            try { size_t used = 0; code = std::stoi(tokens[1], &used); if (used != tokens[1].size()) code = 2; }
+            catch (...) { code = 2; }
+        }
+        runtime.stopped = true;
+        return runtime.status = (code & 255);
+    }
+    std::string filename;
+    std::vector<std::string> childArgs;
+    bool sourced = false;
+    if (scriptInvocation(command, filename, childArgs, sourced)) {
+        std::map<std::string, std::string> local;
+        auto& context = sourced ? vars : (local = vars);
+        return runtime.status = runScriptFile(filename, runtime, context, childArgs, depth + 1);
+    }
+    if (tokens[0] == "cd") {
+        std::string error;
+        if (tokens.size() > 2) { runtime.output += "cd: too many arguments\n"; return runtime.status = 1; }
+        if (!runtime.shell.changeDirectory(tokens.size() > 1 ? tokens[1] : "", error)) {
+            runtime.output += error + "\n"; return runtime.status = 1;
+        }
+        return runtime.status = 0;
+    }
+    if (tokens[0] == "pwd") {
+        runtime.output += runtime.shell.getCwd().string() + "\n";
+        return runtime.status = 0;
+    }
+    if (!runtime.executor.start(command, runtime.shell.getCwd().string())) {
+        runtime.output += "script: failed to start: " + command + "\n";
+        return runtime.status = 127;
+    }
+    int status = 0;
+    while (runtime.executor.isRunning()) {
+        std::vector<pollfd> watched;
+        for (int fd : runtime.executor.outputFds()) {
+            pollfd p{}; p.fd = fd; p.events = POLLIN | POLLHUP;
+            watched.push_back(p);
+        }
+        int ready = poll(watched.data(), watched.size(), 50);
+        if (ready < 0 && errno != EINTR) break;
+        if (ready > 0) for (const auto& p : watched)
+            if (p.revents & (POLLIN | POLLHUP | POLLERR))
+                runtime.output += runtime.executor.readOutput(p.fd);
+        for (const auto& event : runtime.executor.update())
+            if (event.foregroundFinished) status = event.status;
+        if (interruptRequested) {
+            runtime.executor.signalForeground(SIGINT);
+            interruptRequested = 0;
+        }
+        if (runtime.output.size() > 60000) {
+            runtime.executor.signalForeground(SIGINT);
+            runtime.output += "\n[output truncated]\n";
+            break;
+        }
+    }
+    for (int fd : runtime.executor.outputFds()) runtime.output += runtime.executor.readOutput(fd);
+    for (const auto& event : runtime.executor.update())
+        if (event.foregroundFinished) status = event.status;
+    return runtime.status = status;
+}
 
 bool parseMultiWatch(const std::string& command, std::vector<std::string>& commands) {
     const std::string prefix = "multiWatch";
@@ -115,6 +266,8 @@ bool ProcessChannel::start() {
         ShellSession shell;
         // One executor per tab process: jobs survive individual IPC requests.
         CommandExecutor executor;
+        std::map<std::string, std::string> shellVariables;
+        int scriptLastStatus = 0;
         std::string request;
         while (readFrame(toChild[0], request)) {
             // P2: Each child owns an independent shell working directory.
@@ -123,7 +276,27 @@ bool ProcessChannel::start() {
             if (request.rfind("CMD ", 0) == 0) {
                 interruptRequested = 0;
                 suspendRequested = 0;
-                const std::string command = request.substr(4);
+                const std::string command = ScriptVariables::expand(request.substr(4), shellVariables, {}, scriptLastStatus);
+                std::string assignedName, assignedValue;
+                if (ScriptVariables::assignment(command, assignedName, assignedValue)) {
+                    shellVariables[assignedName] = assignedValue;
+                    scriptLastStatus = 0;
+                    if (!sendFrame(fromChild[1], "")) break;
+                    continue;
+                }
+                std::string scriptFilename;
+                std::vector<std::string> scriptArgs;
+                bool scriptSourced = false;
+                if (scriptInvocation(command, scriptFilename, scriptArgs, scriptSourced)) {
+                    std::map<std::string, std::string> localVariables = shellVariables;
+                    auto& vars = scriptSourced ? shellVariables : localVariables;
+                    ScriptRuntime runtime{shell, executor, shellVariables, 0, false, ""};
+                    runtime.status = scriptLastStatus;
+                    scriptLastStatus = runScriptFile(scriptFilename, runtime, vars, scriptArgs, 0);
+                    if (runtime.output.empty()) runtime.output = "";
+                    if (!sendFrame(fromChild[1], runtime.output)) break;
+                    continue;
+                }
                 if (command.rfind("multiWatch", 0) == 0) {
                     std::vector<std::string> commands;
                     if (!parseMultiWatch(command, commands)) {
@@ -164,7 +337,7 @@ bool ProcessChannel::start() {
                 std::string notices;
                 for (const auto& event : executor.update())
                     if (!event.message.empty()) notices += event.message + "\n";
-                const auto commandText = request.substr(4);
+                const auto& commandText = command;
                 std::istringstream input(commandText);
                 std::string operation;
                 input >> operation;
@@ -244,8 +417,10 @@ bool ProcessChannel::start() {
                         if (ready > 0) for (const auto& p : watched)
                             if (p.revents & (POLLIN | POLLHUP | POLLERR))
                                 reply += executor.readOutput(p.fd);
-                        for (const auto& event : executor.update())
+                        for (const auto& event : executor.update()) {
+                            if (event.foregroundFinished) scriptLastStatus = event.status;
                             if (!event.message.empty()) reply += event.message + "\n";
+                        }
                         running = executor.isRunning();
                         if (reply.size() > 60000) {
                             reply += "\n[output truncated]\n";
