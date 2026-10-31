@@ -5,6 +5,8 @@
 terminator
 *.o
 
+*.out
+
 # Backup folders
 src-backup-before-multiwatch/
 
