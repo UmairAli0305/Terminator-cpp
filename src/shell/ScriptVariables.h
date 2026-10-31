@@ -2,6 +2,7 @@
 #define SCRIPT_VARIABLES_H
 
 #include <cctype>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -23,6 +24,13 @@ inline bool assignment(const std::string& line, std::string& name, std::string& 
     name = line.substr(first, i - first);
     value = line.substr(i + 1);
     return true;
+}
+inline std::string resolveVariable(const std::string& key,
+                                   const std::map<std::string, std::string>& variables) {
+    auto it = variables.find(key);
+    if (it != variables.end()) return it->second;
+    const char* inherited = std::getenv(key.c_str());
+    return inherited ? std::string(inherited) : std::string();
 }
 inline std::string expand(const std::string& input,
                           const std::map<std::string, std::string>& variables,
@@ -52,8 +60,7 @@ inline std::string expand(const std::string& input,
             size_t end = input.find('}', i + 2);
             if (end != std::string::npos) {
                 std::string key = input.substr(i + 2, end - i - 2);
-                auto it = variables.find(key);
-                if (it != variables.end()) out += it->second;
+                out += resolveVariable(key, variables);
                 i = end;
                 continue;
             }
@@ -61,8 +68,7 @@ inline std::string expand(const std::string& input,
         if (identifierStart(next)) {
             size_t end = i + 2;
             while (end < input.size() && identifierChar(input[end])) ++end;
-            auto it = variables.find(input.substr(i + 1, end - i - 1));
-            if (it != variables.end()) out += it->second;
+            out += resolveVariable(input.substr(i + 1, end - i - 1), variables);
             i = end - 1;
             continue;
         }

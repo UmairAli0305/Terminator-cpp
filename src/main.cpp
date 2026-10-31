@@ -1,4 +1,5 @@
 #include "gui/TerminalWindow.h"
+#include "shell/SharedHistory.h"
 #include <cstdio>
 #include <cstring>
 
@@ -9,9 +10,18 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "Usage: %s [useProcess=True]\n", argv[0]);
         return 2;
     }
-    if (argc == 2) return runProcessWindow();
-    TerminalWindow terminal;
-    if (!terminal.initialize()) return 1;
-    terminal.run();
-    return 0;
+    if (!SharedHistory::initialize()) {
+        std::fprintf(stderr, "terminator: shared history initialization failed\n");
+        return 1;
+    }
+    int result = 0;
+    if (argc == 2) {
+        result = runProcessWindow();
+    } else {
+        TerminalWindow terminal;
+        if (!terminal.initialize()) result = 1;
+        else terminal.run();
+    }
+    SharedHistory::shutdown();
+    return result;
 }
