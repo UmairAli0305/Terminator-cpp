@@ -467,10 +467,12 @@ void TerminalWindow::processCommandQueue(Tab& tab) {
         if (command.find_first_not_of(" \t\r") == std::string::npos)
             continue;
 
-        SharedHistory::append(item.text);
-        commandHistory = SharedHistory::load();
-        tab.lines.push_back("user@terminator:" +
-            tab.shell.getCwd().filename().string() + "> " + command);
+        if (item.sourceDepth == 0) {
+            SharedHistory::append(item.text);
+            commandHistory = SharedHistory::load();
+            tab.lines.push_back("user@terminator:" +
+                tab.shell.getCwd().filename().string() + "> " + command);
+        }
 
         std::istringstream stream(command);
         std::string name;

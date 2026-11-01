@@ -38,8 +38,10 @@ struct ProcessTab {
     size_t historySavedCursor = 0;
     std::string multilinePending;
     bool busy = false;
+    int scrollOffset = 0; // 0 means follow the newest output
 };
 void addOutput(ProcessTab& tab, const std::string& output) {
+    const size_t before = tab.lines.size();
     size_t pos = 0;
     while (pos < output.size()) {
         size_t end = output.find('\n', pos);
@@ -50,6 +52,8 @@ void addOutput(ProcessTab& tab, const std::string& output) {
         tab.lines.push_back(output.substr(pos, end - pos));
         pos = end + 1;
     }
+    if (tab.scrollOffset > 0)
+        tab.scrollOffset += static_cast<int>(tab.lines.size() - before);
 }
 }
 
@@ -118,17 +122,22 @@ int runProcessWindow() {
         XDrawLine(display, window, gc, 10, 38, 880, 38);
         const ProcessTab& tab = tabs[active];
         const int visible = 20;
-        int start = std::max(0, static_cast<int>(tab.lines.size()) - (visible - 1));
+        const int total = static_cast<int>(tab.lines.size()) + 1; // prompt is last row
+        const int maxOffset = std::max(0, total - visible);
+        tabs[active].scrollOffset = std::clamp(tab.scrollOffset, 0, maxOffset);
+        const int start = std::max(0, total - visible - tabs[active].scrollOffset);
+        const int end = std::min(total, start + visible);
         int y = 65;
-        for (int i = start; i < static_cast<int>(tab.lines.size()); ++i, y += 22) {
-            XDrawString(display, window, gc, 20, y, tab.lines[i].c_str(),
-                        static_cast<int>(tab.lines[i].size()));
+        for (int i = start; i < end; ++i, y += 22) {
+            std::string line;
+            if (i < static_cast<int>(tab.lines.size())) line = tab.lines[i];
+            else line = tab.busy ? "[command running...]" :
+                (tab.multilinePending.empty() ? "user@terminator> " : "> ") +
+                (tab.searchingHistory ? std::string("Enter search term: ") : std::string()) +
+                LineEditing::display(tab.input, tab.cursor);
+            XDrawString(display, window, gc, 20, y, line.c_str(),
+                        static_cast<int>(line.size()));
         }
-        std::string prompt = tab.busy ? "[command running...]" :
-                                           (tab.multilinePending.empty() ? "user@terminator> " : "> ") + (tab.searchingHistory ? std::string("Enter search term: ") : std::string()) +
-            LineEditing::display(tab.input, tab.cursor);
-        XDrawString(display, window, gc, 20, y, prompt.c_str(),
-                    static_cast<int>(prompt.size()));
         if (selectionTab == active) selection.draw(display, window, gc);
         XFlush(display);
         dirty = false;
@@ -136,6 +145,7 @@ int runProcessWindow() {
 
     auto drawInput = [&] {
         const ProcessTab& tab = tabs[active];
+        if (tab.scrollOffset > 0) { dirty = true; return; }
         const int visible = 20;
         int shown = std::min(static_cast<int>(tab.lines.size()), visible - 1);
         int y = 65 + shown * 22;
@@ -163,15 +173,27 @@ int runProcessWindow() {
                 continue;
             }
             if (event.type == Expose) { dirty = true; continue; }
+            if (event.type == ButtonPress &&
+                (event.xbutton.button == Button4 || event.xbutton.button == Button5)) {
+                ProcessTab& tab = tabs[active];
+                const int maxOffset = std::max(0, static_cast<int>(tab.lines.size()) + 1 - 20);
+                const int delta = event.xbutton.button == Button4 ? 3 : -3;
+                tab.scrollOffset = std::clamp(tab.scrollOffset + delta, 0, maxOffset);
+                dirty = true;
+                continue;
+            }
             if (event.type == ButtonPress && event.xbutton.button == Button1 && event.xbutton.y >= 48) {
                 const ProcessTab& tab = tabs[active];
                 std::vector<std::string> visible;
-                int start = std::max(0, static_cast<int>(tab.lines.size()) - 19);
-                for (int i=start; i<static_cast<int>(tab.lines.size()); ++i)
-                    visible.push_back(tab.lines[i]);
-                visible.push_back(tab.busy ? "[command running...]" :
-                    (tab.multilinePending.empty() ? "user@terminator> " : "> ") +
-                    LineEditing::display(tab.input, tab.cursor));
+                const int total = static_cast<int>(tab.lines.size()) + 1;
+                const int start = std::max(0, total - 20 - tab.scrollOffset);
+                const int end = std::min(total, start + 20);
+                for (int i = start; i < end; ++i) {
+                    if (i < static_cast<int>(tab.lines.size())) visible.push_back(tab.lines[i]);
+                    else visible.push_back(tab.busy ? "[command running...]" :
+                        (tab.multilinePending.empty() ? "user@terminator> " : "> ") +
+                        LineEditing::display(tab.input, tab.cursor));
+                }
                 selectionTab = active;
                 selection.begin(event.xbutton.x, event.xbutton.y, std::move(visible));
                 dirty = true;
@@ -260,6 +282,7 @@ int runProcessWindow() {
             }
             if ((event.xkey.state & ControlMask) && (key == XK_l || key == XK_L)) {
                 tabs[active].lines.clear();
+                tabs[active].scrollOffset = 0;
                 dirty = true;
                 continue;
             }
@@ -394,6 +417,7 @@ int runProcessWindow() {
                     }
                     SharedHistory::append(command);
                     tab.history = SharedHistory::load();
+                    tab.scrollOffset = 0;
                     tab.lines.push_back("user@terminator> " + command);
                     if (command == "history") {
                         auto recent = SharedHistory::recent();
