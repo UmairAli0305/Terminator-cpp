@@ -14,6 +14,65 @@
 #include <ctime>
 #include <chrono>
 
+// Built-in echo executed in the command child, preserving pipes/redirection.
+static void runEchoIfRequested(const std::vector<char*>& argv) {
+    if (argv.empty() || !argv[0] || std::strcmp(argv[0], "echo") != 0) return;
+
+    bool escapes = false;
+    bool newline = true;
+    size_t first = 1;
+    // Accept combinations of -n and -e (and -E to disable escapes).
+    while (first < argv.size() && argv[first]) {
+        const char* opt = argv[first];
+        if (opt[0] != '-' || opt[1] == '\0') break;
+        size_t j = 1;
+        while (opt[j] == 'n' || opt[j] == 'e' || opt[j] == 'E') ++j;
+        if (opt[j] != '\0' || j == 1) break;
+        for (j = 1; opt[j]; ++j) {
+            if (opt[j] == 'n') newline = false;
+            else escapes = (opt[j] == 'e');
+        }
+        ++first;
+    }
+
+    std::string output;
+    bool stop = false;
+    for (size_t i = first; i < argv.size() && argv[i] && !stop; ++i) {
+        if (i > first) output += ' ';
+        const char* arg = argv[i];
+        for (size_t j = 0; arg[j]; ++j) {
+            if (escapes && arg[j] == '\\' && arg[j + 1]) {
+                char next = arg[++j];
+                switch (next) {
+                    case 'a': output += '\a'; break;
+                    case 'b': output += '\b'; break;
+                    case 'c': stop = true; newline = false; break;
+                    case 'e': output += '\x1b'; break;
+                    case 'f': output += '\f'; break;
+                    case 'n': output += '\n'; break;
+                    case 'r': output += '\r'; break;
+                    case 't': output += '\t'; break;
+                    case 'v': output += '\v'; break;
+                    case '\\': output += '\\'; break;
+                    default: output += '\\'; output += next; break;
+                }
+                if (stop) break;
+            } else {
+                output += arg[j];
+            }
+        }
+    }
+    if (newline) output += '\n';
+    size_t offset = 0;
+    while (offset < output.size()) {
+        ssize_t n = write(STDOUT_FILENO, output.data() + offset, output.size() - offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) _exit(1);
+        offset += static_cast<size_t>(n);
+    }
+    _exit(0);
+}
+
 // Task 4: parse redirection operators without passing them to execvp.
 // This is intentionally not the full Task 3 quoting/expansion parser.
 namespace {
@@ -114,6 +173,7 @@ static bool substitute(const std::string& expression, const std::string& cwd,
             std::vector<char*> argv;
             for (const auto& arg : cmd.args) argv.push_back(const_cast<char*>(arg.c_str()));
             argv.push_back(nullptr);
+            runEchoIfRequested(argv);
             execvp(argv[0], argv.data());
             dprintf(STDERR_FILENO, "terminator: substitution: %s: %s\n", argv[0], strerror(errno));
             _exit(127);
@@ -231,7 +291,18 @@ Redirection parseRedirection(const std::string& command, const std::string& cwd)
             started = true;
             continue;
         }
-        if (c == '\'' || c == '"') { quote = c; started = true; }
+        // Expand a leading unquoted ~ (or ~/path) using HOME.
+        // Quoted/escaped tildes and ~username remain literal.
+        if (c == '~' && !started &&
+            (i + 1 == command.size() || command[i + 1] == '/' ||
+             command[i + 1] == ' ' || command[i + 1] == '\t' ||
+             command[i + 1] == '\n' || command[i + 1] == '<' ||
+             command[i + 1] == '>')) {
+            const char* home = std::getenv("HOME");
+            word += home ? home : "~";
+            started = true;
+        }
+        else if (c == '\'' || c == '"') { quote = c; started = true; }
         else if (c == '\\' && i + 1 < command.size()) {
             if (command[i + 1] != '\n') { word += command[++i]; started = true; }
             else ++i;
@@ -342,7 +413,8 @@ bool CommandExecutor::start(const std::string& command, const std::string& cwd, 
                     std::vector<char*> argv;
                     for (const auto& a : r.args) argv.push_back(const_cast<char*>(a.c_str()));
                     argv.push_back(nullptr);
-                    execvp(argv[0], argv.data());
+            runEchoIfRequested(argv);
+            execvp(argv[0], argv.data());
                     dprintf(STDERR_FILENO, "terminator: %s: %s\n", argv[0], strerror(errno));
                     _exit(errno == ENOENT ? 127 : 126);
                 }
@@ -408,7 +480,8 @@ bool CommandExecutor::start(const std::string& command, const std::string& cwd, 
             if (dup2(outputFd, STDOUT_FILENO) == -1) { perror("dup2 stdout"); _exit(1); }
             close(outputFd);
         }
-        execvp(argv[0], argv.data());
+            runEchoIfRequested(argv);
+            execvp(argv[0], argv.data());
         if (errno == ENOENT) dprintf(STDERR_FILENO, "terminator: %s: command not found\n", argv[0]);
         else perror("execvp");
         _exit(errno == ENOENT ? 127 : 126);
@@ -560,7 +633,8 @@ bool CommandExecutor::startMultiWatch(const std::vector<std::string>& commands,
                             for (const auto& arg : cmd.args)
                                 argv.push_back(const_cast<char*>(arg.c_str()));
                             argv.push_back(nullptr);
-                            execvp(argv[0], argv.data());
+            runEchoIfRequested(argv);
+            execvp(argv[0], argv.data());
                             dprintf(STDERR_FILENO, "multiWatch: %s: %s\n", argv[0], strerror(errno));
                             _exit(127);
                         }
