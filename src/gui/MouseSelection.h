@@ -11,6 +11,7 @@ class MouseSelection {
     std::vector<std::string> rows;
     int anchorRow = -1, anchorCol = 0, endRow = -1, endCol = 0;
     bool dragging = false;
+    int selectionRight = 870, selectionBottom = 525;
     XFontStruct* font = nullptr; // Borrowed: owned by the X server/GC.
     int charPosition(const std::string& s, int x) const {
         x = std::max(0, x - 20);
@@ -25,15 +26,25 @@ class MouseSelection {
     int rowAt(int y) const { return std::clamp((y - 54) / 22, 0, std::max(0, static_cast<int>(rows.size()) - 1)); }
 public:
     void setFont(XFontStruct* f) { font = f; }
+    void setBounds(int width, int height) { selectionRight = std::max(20, width - 30); selectionBottom = std::max(48, height - 25); }
     void clear() { rows.clear(); anchorRow = endRow = -1; dragging = false; }
     bool active() const { return anchorRow >= 0 && endRow >= 0 && !rows.empty(); }
     void begin(int x, int y, std::vector<std::string> visible) {
         clear();
-        if (visible.empty() || y < 48 || y > 525 || x < 20 || x > 870) return;
+        if (visible.empty() || y < 48 || y > selectionBottom || x < 20 || x > selectionRight) return;
         rows = std::move(visible);
         anchorRow = endRow = rowAt(y);
         anchorCol = endCol = charPosition(rows[anchorRow], x);
         dragging = true;
+    }
+    // Highlight all visible rows; clipboard may hold additional off-screen history.
+    void selectAllVisible(std::vector<std::string> visible) {
+        clear();
+        if (visible.empty()) return;
+        rows = std::move(visible);
+        anchorRow = anchorCol = 0;
+        endRow = static_cast<int>(rows.size()) - 1;
+        endCol = static_cast<int>(rows.back().size());
     }
     void move(int x, int y) {
         if (!dragging || rows.empty()) return;

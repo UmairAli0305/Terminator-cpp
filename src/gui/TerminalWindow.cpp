@@ -1,3 +1,4 @@
+#include "WrappedRows.h"
 #include "../shell/FilenameCompletion.h"
 #include "../shell/HistorySearch.h"
 #include "../shell/HotkeyConfig.h"
@@ -63,13 +64,22 @@ Tab& TerminalWindow::currentTab() {
     return *tabs[activeTab];
 }
 
+std::vector<std::string> TerminalWindow::displayRows(const Tab& tab) const {
+    std::string prompt = tab.executor.isRunning() ? "[command running...]" :
+        (tab.multilinePending.empty() ?
+         "user@terminator:" + tab.shell.getCwd().filename().string() + "> " : "> ") +
+        (tab.searchingHistory ? std::string("Enter search term: ") : std::string()) +
+        LineEditing::display(tab.input, tab.cursor);
+    return WrappedRows::build(tab.lines, prompt, selectionFont, textWidth());
+}
+
 void TerminalWindow::scroll(int amount) {
     Tab& tab = currentTab();
 
-    const int visibleRows = 20;
+    const int visibleRows = visibleRowCount();
 
     // Include the current prompt as one display row.
-    int totalRows = static_cast<int>(tab.lines.size()) + 1;
+    int totalRows = static_cast<int>(displayRows(tab).size());
 
     int maxOffset = std::max(0, totalRows - visibleRows);
 
@@ -162,7 +172,7 @@ bool TerminalWindow::initialize() {
     XSelectInput(
     display,
     window,
-    ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask );
+    ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask | StructureNotifyMask );
 
     gc = XCreateGC(display, window, 0, nullptr);
 
@@ -174,6 +184,7 @@ bool TerminalWindow::initialize() {
     clipboard = std::make_unique<X11Clipboard>(display, window);
     selectionFont = XQueryFont(display, XGContextFromGC(gc));
     selection.setFont(selectionFont);
+    selection.setBounds(windowWidth, windowHeight);
     XMapWindow(display, window);
     XFlush(display);
 
@@ -201,59 +212,36 @@ void TerminalWindow::redraw() {
         x += 100;
     }
 
-    XDrawLine(display, window, gc, 10, 38, 880, 38);
+    XDrawLine(display, window, gc, 10, 38, windowWidth - 20, 38);
 
     Tab& tab = currentTab();
 
-    const int visibleRows = 20;
+    const int visibleRows = visibleRowCount();
     const int lineHeight = 22;
     const int topY = 65;
 
-    int totalRows = static_cast<int>(tab.lines.size()) + 1;
+    const auto rows = displayRows(tab);
+    int totalRows = static_cast<int>(rows.size());
     int maxOffset = std::max(0, totalRows - visibleRows);
-
-    tab.scrollOffset = std::clamp(
-        tab.scrollOffset, 0, maxOffset
-    );
-
-    int start = std::max(
-        0, totalRows - visibleRows - tab.scrollOffset
-    );
-
-    int end = std::min(totalRows, start + visibleRows);
-
+    tab.scrollOffset = std::clamp(tab.scrollOffset, 0, maxOffset);
+    auto shown = WrappedRows::visible(rows, tab.scrollOffset, visibleRows);
+    const std::string prompt = tab.executor.isRunning() ? "[command running...]" :
+        (tab.multilinePending.empty() ? "user@terminator:" + tab.shell.getCwd().filename().string() + "> " : "> ") +
+        (tab.searchingHistory ? std::string("Enter search term: ") : std::string()) +
+        LineEditing::display(tab.input, tab.cursor);
+    lastPromptWrapped = WrappedRows::wrap(prompt, selectionFont, textWidth()).size() > 1;
     int y = topY;
-
-    for (int i = start; i < end; i++) {
-        std::string line;
-
-        if (i < static_cast<int>(tab.lines.size())) {
-            line = tab.lines[i];
-        } else {
-            if (tab.executor.isRunning()) {
-                line = "[command running...]";
-            } else {
-                line = (tab.multilinePending.empty() ?
-                       "user@terminator:" + tab.shell.getCwd().filename().string() + "> " :
-                       "> ") + (tab.searchingHistory ? std::string("Enter search term: ") : std::string()) + LineEditing::display(tab.input, tab.cursor);
-            }
-        }
-
-        XDrawString(
-            display, window, gc,
-            20, y,
-            line.c_str(),
-            static_cast<int>(line.size())
-        );
-
+    for (const auto& line : shown) {
+        XDrawString(display, window, gc, 20, y,
+                    line.c_str(), static_cast<int>(line.size()));
         y += lineHeight;
     }
 
     // Draw scrollbar track.
-    const int trackX = 880;
+    const int trackX = windowWidth - 20;
     const int trackY = 48;
     const int trackWidth = 10;
-    const int trackHeight = 477;
+    const int trackHeight = std::max(1, windowHeight - 73);
 
     XDrawRectangle(
         display, window, gc,
@@ -291,51 +279,25 @@ void TerminalWindow::redraw() {
     if (selectionTab == activeTab) selection.draw(display, window, gc);
     XFlush(display);
 }
-void TerminalWindow::redrawInputLine() { // optimization
+void TerminalWindow::redrawInputLine() {
     Tab& tab = currentTab();
-
-    const int visibleRows = 20;
-    const int lineHeight = 22;
-    const int topY = 65;
-
-    int totalRows = static_cast<int>(tab.lines.size()) + 1;
-
-    int start = std::max(0, totalRows - visibleRows);
-
-    int promptRow = totalRows - 1;
-
-    int y = topY + (promptRow - start) * lineHeight;
-
-    // Clear only the prompt row, not the entire window.
-    XClearArea(
-        display,
-        window,
-        20,
-        y - 17,
-        850,
-        lineHeight,
-        False
-    );
-
-    std::string prompt =
-        (tab.multilinePending.empty() ?
-        "user@terminator:" + tab.shell.getCwd().filename().string() + "> " :
-        "> ") + (tab.searchingHistory ? std::string("Enter search term: ") : std::string()) + LineEditing::display(tab.input, tab.cursor);
-
-    XDrawString(
-        display,
-        window,
-        gc,
-        20,
-        y,
-        prompt.c_str(),
-        static_cast<int>(prompt.size())
-    );
-
+    const auto rows = displayRows(tab);
+    const std::string prompt = tab.executor.isRunning() ? "[command running...]" :
+        (tab.multilinePending.empty() ? "user@terminator:" + tab.shell.getCwd().filename().string() + "> " : "> ") +
+        (tab.searchingHistory ? std::string("Enter search term: ") : std::string()) +
+        LineEditing::display(tab.input, tab.cursor);
+    const bool wrapped = WrappedRows::wrap(prompt, selectionFont, textWidth()).size() > 1;
+    if (wrapped || lastPromptWrapped || tab.scrollOffset != 0) {
+        redraw();
+        return;
+    }
+    const int start = std::max(0, static_cast<int>(rows.size()) - visibleRowCount());
+    const int y = 65 + (static_cast<int>(rows.size()) - 1 - start) * 22;
+    XClearArea(display, window, 20, y - 17, std::max(1, windowWidth - 50), 22, False);
+    XDrawString(display, window, gc, 20, y, prompt.c_str(),
+                static_cast<int>(prompt.size()));
     XFlush(display);
 }
-
-
 
 void TerminalWindow::appendOutput(
     Tab& tab, const std::string& text
@@ -682,9 +644,25 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
     HotkeyConfig::translate(key, event.state);
 
     if ((event.state & ControlMask) && (event.state & ShiftMask)) {
+        if (key == XK_a || key == XK_A) {
+            Tab& tab = currentTab();
+            allSelectedText.clear();
+            for (const auto& line : tab.lines) {
+                allSelectedText += line;
+                allSelectedText += '\n';
+            }
+            allSelectedText += tab.input;
+            allSelectionTab = activeTab;
+            selectionTab = activeTab;
+            selection.selectAllVisible(WrappedRows::visible(
+                displayRows(tab), tab.scrollOffset, visibleRowCount()));
+            redraw();
+            return;
+        }
         if (key == XK_c || key == XK_C) {
-            clipboard->copy(selectionTab == activeTab && !selection.selectedText().empty()
-                            ? selection.selectedText() : currentTab().input);
+            clipboard->copy(allSelectionTab == activeTab ? allSelectedText :
+                            (selectionTab == activeTab && !selection.selectedText().empty()
+                             ? selection.selectedText() : currentTab().input));
             return;
         }
         if (key == XK_v || key == XK_V) {
@@ -889,7 +867,7 @@ void TerminalWindow::handleKeyPress(XKeyEvent& event) {
     redraw();
 }
 
-void TerminalWindow::run() {
+void TerminalWindow::run() { // keeps the Terminator running until the user exits.
     bool running = true;
 
     while (running) {
@@ -910,6 +888,17 @@ void TerminalWindow::run() {
             }
 
 
+            if (event.type == ConfigureNotify) {
+                if (windowWidth != event.xconfigure.width || windowHeight != event.xconfigure.height) {
+                    windowWidth = std::max(1, event.xconfigure.width);
+                    windowHeight = std::max(1, event.xconfigure.height);
+                    lastPromptWrapped = false;
+                    selection.setBounds(windowWidth, windowHeight);
+                    selection.clear();
+                    redraw();
+                }
+                continue;
+            }
             if (event.type == Expose &&
                 event.xexpose.count == 0) {
                 redraw();
@@ -930,18 +919,11 @@ void TerminalWindow::run() {
             else if (event.type == ButtonPress) {
                 if (event.xbutton.button == Button1 && event.xbutton.y >= 48) {
                     Tab& tab = currentTab();
-                    std::vector<std::string> visible;
-                    const int total = static_cast<int>(tab.lines.size()) + 1;
-                    const int start = std::max(0, total - 20 - tab.scrollOffset);
-                    const int end = std::min(total, start + 20);
-                    for (int i=start; i<end; ++i) {
-                        if (i < static_cast<int>(tab.lines.size())) visible.push_back(tab.lines[i]);
-                        else visible.push_back(tab.executor.isRunning() ? "[command running...]" :
-                            (tab.multilinePending.empty() ? "user@terminator:" +
-                            tab.shell.getCwd().filename().string() + "> " : "> ") +
-                            LineEditing::display(tab.input, tab.cursor));
-                    }
+                    std::vector<std::string> visible = WrappedRows::visible(
+                        displayRows(tab), tab.scrollOffset, visibleRowCount());
                     selectionTab = activeTab;
+                    allSelectionTab = -1;
+                    allSelectedText.clear();
                     selection.begin(event.xbutton.x, event.xbutton.y, std::move(visible));
                     redraw();
                 }

@@ -8,6 +8,7 @@
 #include "../tabs/Tab.h"
 
 #include <memory>
+#include <algorithm>
 class X11Clipboard;
 #include <mutex>
 #include <string>
@@ -22,6 +23,13 @@ private:
     MouseSelection selection;
     XFontStruct* selectionFont = nullptr;
     int selectionTab = -1;
+    int allSelectionTab = -1;
+    std::string allSelectedText;
+    bool lastPromptWrapped = false;
+    int windowWidth = 900;
+    int windowHeight = 550;
+    int textWidth() const { return std::max(1, windowWidth - 60); }
+    int visibleRowCount() const { return std::max(1, (windowHeight - 75) / 22); }
     // Protects shell/executor/command queues and GUI-visible tab state.
     std::mutex stateMutex;
     int wakeReadFd = -1;
@@ -33,6 +41,7 @@ private:
     std::vector<std::unique_ptr<Tab>> retiredTabs;
     int activeTab = 0;
 
+    std::vector<std::string> displayRows(const Tab& tab) const;
     void scroll(int amount); //scrolling function
 
     void redraw();

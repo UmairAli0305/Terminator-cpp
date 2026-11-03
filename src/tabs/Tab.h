@@ -21,9 +21,9 @@
 #include <vector>
 
 class Tab {
-private:
-    std::thread worker;
-    std::mutex taskMutex;
+private: 
+    std::thread worker; //Worker thread belonging to the tab
+    std::mutex taskMutex; // The mutex protects the task queue because the GUI thread and worker thread can access it concurrently.
     std::condition_variable taskReady;
     std::deque<std::function<void()>> tasks;
     bool stopping = false;
@@ -118,7 +118,7 @@ public:
     bool isReadingOutput() const { return readingOutput.load(); }
 
     CompletionChoice completionChoice;
-    std::string input;
+    std::string input; //Current command being typed
     size_t cursor = 0;
     bool searchingHistory = false;
     std::string historySavedInput;
